@@ -440,6 +440,7 @@ def train(args: argparse.Namespace) -> None:
             # 这些计数用于 epoch 指标；loss 按样本数加权，而不是简单平均 batch loss。
             loss_sum += loss.detach() * labels.size(0)
             sample_count += labels.size(0)
+            # 梯度更新只和 backward() 算梯度、optimizer.step() 用梯度更新参数有关；epoch 尾部的指标汇总、保存 checkpoint、barrier 都不参与梯度计算，对梯度本身没有影响。可能影响后续训练的是 scheduler、RNG、数据顺序这类状态。
             if is_update:
                 # 7. optimizer step 边界。
                 #    只有这里真正更新参数、推进 scheduler/global_step，并允许
