@@ -84,6 +84,7 @@ def gather_rng_states(loader_generator: torch.Generator) -> list[dict[str, Any]]
     dist.gather_object(local_state, gathered, dst=0)
     return gathered  # type: ignore[return-value]
 
+
 # 生成和处理数据
 class SyntheticBinaryDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     """Deterministic two-class data, generated once from a local RNG."""
@@ -107,6 +108,7 @@ class SyntheticBinaryDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     # 调用者：DataLoader 在迭代每个 batch 时调用。
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.features[index], self.labels[index]
+
 
 # 网络结构
 class MLP(nn.Module):
@@ -197,8 +199,17 @@ def build_scheduler(
 # 调用者：load_checkpoint() 在加载状态前调用。
 def validate_resume_config(saved: dict[str, Any], current: dict[str, Any]) -> None:
     required = (
-        "device", "samples", "input_dim", "hidden_dim", "batch_size",
-        "accumulation_steps", "learning_rate", "seed", "amp", "warmup_steps", "world_size",
+        "device",
+        "samples",
+        "input_dim",
+        "hidden_dim",
+        "batch_size",
+        "accumulation_steps",
+        "learning_rate",
+        "seed",
+        "amp",
+        "warmup_steps",
+        "world_size",
     )
     mismatches = [key for key in required if saved.get(key) != current.get(key)]
     if mismatches:
@@ -357,7 +368,7 @@ def train(args: argparse.Namespace) -> None:
     # 共享输出只由 rank 0 创建和写入，避免多个进程竞争同一个文件。
     # 共享输出：config/metrics/日志只由 rank 0 写，避免竞争。
     # 大模型：日志仍 rank 0 写；checkpoint 分片并行写，rank 0 只提交元数据。
-    # 多节点：需共享存储；barrier 保证 rank 0 写完后继续。  
+    # 多节点：需共享存储；barrier 保证 rank 0 写完后继续。
     if rank() == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
@@ -381,6 +392,23 @@ def train(args: argparse.Namespace) -> None:
         sample_count = torch.zeros(1, device=device)
         batch_count = len(loader)
 
+        # ============================================================
+        # DDP 训练核心概念速览
+        # ============================================================
+        # 1. DDP：一进程一设备，每个 rank 持完整模型副本，读不同数据分片。
+        # 2. 前向/反向各 rank 独立算；反向时 all-reduce 同步梯度，得到平均梯度。
+        # 3. 各 rank 用相同平均梯度各自 optimizer.step()，参数保持一致。
+        # 4. 数据分片由 DistributedSampler 完成；每个 micro-batch 是不同数据。
+        # 5. 梯度累积：单 rank 内多个 micro-batch 串行前向/反向，梯度累加后平均。
+        # 6. all-reduce 与梯度累积数学上都是对梯度做加权平均，只是维度不同：
+        #    - 梯度累积：同一 rank 内，时间/批次维度
+        #    - all-reduce：跨 rank，设备维度
+        #    全局梯度 = (1/(A*W)) * Σ_r Σ_a g_{r,a}
+        # 7. 单 rank 多 micro-batch 必须串行：单卡只有一份计算/显存资源；
+        #    并行会成倍占显存，且梯度累加存在写竞争。
+        # 8. 多 rank 能并行：多张卡独立计算/显存，空间换时间。
+        # ============================================================
+
         # 5. 内层 micro-batch 循环。
         #    一个 DataLoader batch 是一个 micro-batch；accumulation_steps 个
         #    micro-batch 才组成一次 optimizer update。
@@ -394,7 +422,10 @@ def train(args: argparse.Namespace) -> None:
             features, labels = features.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             # 最后一个窗口可能不足 accumulation_steps，因此按实际窗口大小
             # 缩放 loss，保证累计梯度量级与等效大 batch 一致。
-            window_size = min(args.accumulation_steps, batch_count - (batch_index // args.accumulation_steps) * args.accumulation_steps)
+            window_size = min(
+                args.accumulation_steps,
+                batch_count - (batch_index // args.accumulation_steps) * args.accumulation_steps,
+            )
             # 当前 batch 是否是本次梯度累积窗口的最后一个 batch。
             is_update = (batch_index + 1) % args.accumulation_steps == 0 or batch_index == batch_count - 1
             # [no_sync] 累积窗口的中间 batch 不做梯度 all-reduce，最后一个 batch 再同步。
@@ -466,7 +497,12 @@ def train(args: argparse.Namespace) -> None:
         rng_states = gather_rng_states(loader_generator)
         if rank() == 0:
             samples = int(sample_count.item())
-            record = {"epoch": epoch + 1, "loss": loss_sum.item() / samples, "samples_per_second": samples / elapsed, "world_size": world_size()}
+            record = {
+                "epoch": epoch + 1,
+                "loss": loss_sum.item() / samples,
+                "samples_per_second": samples / elapsed,
+                "world_size": world_size(),
+            }
             with metrics_path.open("a", encoding="utf-8") as metrics_file:
                 metrics_file.write(json.dumps(record) + "\n")
             save_checkpoint(
@@ -522,7 +558,9 @@ def parse_args() -> argparse.Namespace:
         or args.checkpoint_every_steps < 1
         or args.warmup_steps < 0
     ):
-        parser.error("epochs, batch-size, accumulation-steps, and checkpoint-every-steps must be positive; warmup-steps cannot be negative")
+        parser.error(
+            "epochs, batch-size, accumulation-steps, and checkpoint-every-steps must be positive; warmup-steps cannot be negative"
+        )
     return args
 
 

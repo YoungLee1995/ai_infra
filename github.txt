@@ -1,0 +1,32 @@
+ssh -T git@github-personal
+git add .
+git commit -m "feat: add md"
+git push
+
+git remote set-url origin git@github-personal:YoungLee1995/scientific-agent-skills.git
+git config --local user.name "YoungLee1995"
+git config --local user.email "948231014@qq.com"
+
+git config --global credential.helper store
+git add .
+git commit -m "[feat]merge main" #提交当前更改
+git push #上传当前更改
+git switch liard_softmax1
+git checkout -b liard1 orgin/liard1
+git checkout -b for_qwen2
+git checkout -b for_qwen2 orgin/for_qwen2
+
+git config --global user.email "liard@smarterasemi.com"
+git config --global user.name "liard"
+
+
+git submodule update --init --recursive
+
+git branch -D liard_case2  #删除本地分支
+git push origin --delete liard_case2 #删除远程分支
+
+git checkout simulator_main
+git checkout liard_new_case -- /workspace/ni900-sdk/Build/Makefile.rules
+git status
+git add application/test_matmul_sizes
+git commit -m "Merge /workspace/ni900-sdk/Build/Makefile.rules from liard_new_case"
