@@ -489,6 +489,7 @@ def train(args: argparse.Namespace) -> None:
 
         # 8. epoch 汇总。
         #    loss_sum/sample_count 先 all-reduce，rank 0 才能得到全局平均 loss。
+        #    全局平均 loss 是训练过程的“仪表盘”，用来判断训练是否正常、收敛如何、不同实验怎么比；它不参与梯度计算，也不直接影响参数更新。
         elapsed = time.perf_counter() - started
         if is_distributed():
             dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
