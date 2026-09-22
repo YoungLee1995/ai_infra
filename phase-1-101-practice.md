@@ -34,11 +34,60 @@
 ```bash
 python3 -m unittest discover -s tests -v
 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
-  --device cpu --epochs 2 --samples 512 --batch-size 16 \
-  --checkpoint-dir runs/cpu-101
+  --device cpu --epochs 10 --samples 1024 --batch-size 8 \
+ --checkpoint-dir runs/cpu-101
 ```
 
 这一步只验证 DDP 控制流，不模拟 GPU 性能。101 上不要把 CPU 的 samples/s 与 200 的 GPU 结果放在同一张性能结论表里。
+
+## CPU 断点恢复演练
+
+从一开始就将总训练计划设为 10 个 epoch。此命令会在第 80 个 optimizer step
+（第 5 个 epoch 完成时）安全停止；`--checkpoint-every-steps 10` 会额外生成 step
+checkpoint，epoch 结束时也会更新 `checkpoint.pt`。
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cpu --epochs 10 --samples 512 --batch-size 16 \
+  --checkpoint-every-steps 10 --stop-after-steps 80 \
+  --checkpoint-dir runs/cpu-resume-check
+```
+
+确认 `runs/cpu-resume-check/checkpoint.pt` 已生成后，以相同的数据、batch、
+seed、world size、精度和总 epoch 计划恢复；仅去掉用于演练的
+`--stop-after-steps` 并增加 `--resume`：
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cpu --epochs 10 --samples 512 --batch-size 16 \
+  --checkpoint-every-steps 10 --checkpoint-dir runs/cpu-resume-check \
+  --resume runs/cpu-resume-check/checkpoint.pt
+```
+
+恢复命令应打印 `resumed from epoch 5, batch 0, step 80`。结束后
+`metrics.jsonl` 应有 10 行，覆盖 epoch 1 到 10；`checkpoint.pt` 中的
+`epoch` 应为 10、`global_step` 应为 160。若恢复前修改 samples、batch size、
+累积步数、learning rate、seed、设备、AMP 或 world size，配置校验会拒绝恢复，
+这是为了避免把不同训练语义的状态静默拼接。
+
+`--stop-after-steps` 仅用于这个可重复的 CPU 演练；实际训练依靠定期 checkpoint
+和外部中断/故障恢复，而不会预先声明停止 step。
+
+## 不间断 10 Epoch 对照
+
+以下命令与恢复实验使用相同的训练参数，但从头连续训练 10 个 epoch。它使用
+独立目录，不能与 `runs/cpu-resume-check` 共用，否则已有 metrics 和 checkpoint
+会混入对照结果。
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cpu --epochs 10 --samples 512 --batch-size 16 \
+  --checkpoint-every-steps 10 --checkpoint-dir runs/cpu-continuous-10
+```
+
+两组实验使用相同的 10-epoch scheduler 计划，结束时都应达到 `epoch=10`、
+`global_step=160`。在同一软件和硬件环境中，它们的 metrics 和最终模型权重应一致；
+不一致说明 checkpoint、RNG、DataLoader 状态或恢复位置存在问题。
 
 ## 发布给 200 前的检查
 

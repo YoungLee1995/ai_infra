@@ -374,6 +374,7 @@ def train(args: argparse.Namespace) -> None:
         (output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     criterion = nn.CrossEntropyLoss()
+    stop_requested = False
     # 4. 外层 epoch 循环。
     #    resume 的第一个 epoch 可能只执行剩余 batch；后续 epoch 执行完整数据集。
     for epoch in range(start_epoch, args.epochs):
@@ -391,6 +392,7 @@ def train(args: argparse.Namespace) -> None:
         loss_sum = torch.zeros(1, device=device)
         sample_count = torch.zeros(1, device=device)
         batch_count = len(loader)
+        window_samples = 0
 
         # ============================================================
         # DDP 训练核心概念速览
@@ -440,6 +442,7 @@ def train(args: argparse.Namespace) -> None:
             # 这些计数用于 epoch 指标；loss 按样本数加权，而不是简单平均 batch loss。
             loss_sum += loss.detach() * labels.size(0)
             sample_count += labels.size(0)
+            window_samples += labels.size(0)
             # 梯度更新只和 backward() 算梯度、optimizer.step() 用梯度更新参数有关；epoch 尾部的指标汇总、保存 checkpoint、barrier 都不参与梯度计算，对梯度本身没有影响。可能影响后续训练的是 scheduler、RNG、数据顺序这类状态。
             if is_update:
                 # 7. optimizer step 边界。
@@ -451,20 +454,28 @@ def train(args: argparse.Namespace) -> None:
                 scheduler.step()
                 global_step += 1
                 # 每个 rank 处理相同数量样本，因此用 world_size 换算全局样本数。
-                samples_seen += labels.size(0) * world_size()
-                should_checkpoint = global_step % args.checkpoint_every_steps == 0
+                samples_seen += window_samples * world_size()
+                window_samples = 0
+                stop_after_this_step = (
+                    args.stop_after_steps is not None and global_step == args.stop_after_steps
+                )
+                should_checkpoint = global_step % args.checkpoint_every_steps == 0 or stop_after_this_step
                 if should_checkpoint:
                     # 先汇总所有 rank 的 RNG；rank 0 随后写入统一 checkpoint。
                     rng_states = gather_rng_states(loader_generator)
                 if should_checkpoint and rank() == 0:
+                    # epoch 最后一批已完成时，恢复位置应指向下一 epoch，不能再跳过
+                    # 一个已经没有剩余 batch 的 epoch。
+                    checkpoint_epoch = epoch + 1 if batch_index == batch_count - 1 else epoch
+                    checkpoint_batch = 0 if batch_index == batch_count - 1 else batch_index + 1
                     # 编号快照用于回退，checkpoint.pt 作为最新状态入口。
                     save_checkpoint(
                         output_dir / f"checkpoint-step-{global_step:08d}.pt",
                         model,
                         optimizer,
                         scaler,
-                        epoch,
-                        batch_index + 1,
+                        checkpoint_epoch,
+                        checkpoint_batch,
                         global_step,
                         samples_seen,
                         scheduler,
@@ -476,8 +487,8 @@ def train(args: argparse.Namespace) -> None:
                         model,
                         optimizer,
                         scaler,
-                        epoch,
-                        batch_index + 1,
+                        checkpoint_epoch,
+                        checkpoint_batch,
                         global_step,
                         samples_seen,
                         scheduler,
@@ -487,6 +498,13 @@ def train(args: argparse.Namespace) -> None:
                 if should_checkpoint and is_distributed():
                     # rank 0 写盘期间其他 rank 等待，确保所有进程从同一个 step 继续。
                     dist.barrier()
+                if stop_after_this_step:
+                    if batch_index != batch_count - 1:
+                        raise ValueError("--stop-after-steps must fall on an epoch boundary")
+                    stop_requested = True
+                    if rank() == 0:
+                        print(f"stopped after checkpoint at step {global_step}", flush=True)
+                    break
 
         # 8. epoch 汇总。
         #    loss_sum/sample_count 先 all-reduce，rank 0 才能得到全局平均 loss。
@@ -524,6 +542,8 @@ def train(args: argparse.Namespace) -> None:
         if is_distributed():
             # 确保 rank 0 保存完成后，所有 rank 再进入下一个 epoch。
             dist.barrier()
+        if stop_requested:
+            break
     # 9. 训练结束，释放进程组；单进程模式下不执行 destroy。
     if is_distributed():
         dist.destroy_process_group()
@@ -552,6 +572,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-dir", default="runs/default")
     parser.add_argument("--resume", help="path to a checkpoint created by this trainer")
+    parser.add_argument(
+        "--stop-after-steps",
+        type=int,
+        help="test-only controlled stop at an epoch-boundary checkpoint",
+    )
     args = parser.parse_args()
     if (
         args.epochs < 1
@@ -559,9 +584,10 @@ def parse_args() -> argparse.Namespace:
         or args.accumulation_steps < 1
         or args.checkpoint_every_steps < 1
         or args.warmup_steps < 0
+        or (args.stop_after_steps is not None and args.stop_after_steps < 1)
     ):
         parser.error(
-            "epochs, batch-size, accumulation-steps, and checkpoint-every-steps must be positive; warmup-steps cannot be negative"
+            "epochs, batch-size, accumulation-steps, checkpoint-every-steps, and stop-after-steps must be positive; warmup-steps cannot be negative"
         )
     return args
 

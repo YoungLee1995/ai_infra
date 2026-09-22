@@ -1,6 +1,6 @@
 ssh -T git@github-personal
 git add .
-git commit -m "feat: add requirements"
+git commit -m "feat: add cp test"
 git push
 
 git remote set-url origin git@github-personal:YoungLee1995/scientific-agent-skills.git
