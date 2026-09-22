@@ -1,2 +1,10 @@
-torch>=2.1
+# The tests use torch.amp.GradScaler, which is available through the unified
+# torch.amp API starting with PyTorch 2.3.
+torch>=2.3
 
+# torch.distributed.gather_object serializes gathered Python objects through
+# Tensor.numpy(), which is used by the DDP checkpoint RNG-state collection.
+numpy>=1.24
+
+# Test runner used to collect and execute tests/test_train.py.
+pytest>=8.0
