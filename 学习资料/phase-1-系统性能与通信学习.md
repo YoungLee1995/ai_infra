@@ -232,345 +232,337 @@ ring all-reduce 通常带宽利用率高，但每个 rank 经历多个邻居阶�
 完成本文后，下一步是把一个真实 profiling 报告作为第 2 阶段证据包：命令、环境、trace 截图、指标表和一次被数据推翻或验证的优化假设。
 
 
-下面给出一段可直接追加到文档末尾的完整例子。它把“训练变慢”的现场按文档顺序走一遍：先建性能模型，再看 Linux 进程与 CPU，再用火焰图定位 CPU 热点，用 gdb 判断 hang，用 profiler 看 GPU 时间线，最后用 NCCL 日志和网络计数器验证通信假设。例子中的数字、PID、路径、命令输出均为教学用构造，真实环境需替换。
+## 9. 当前项目的 CPU 实操：从单进程到 Gloo DDP、checkpoint 与诊断边界
 
----
+本章只使用仓库中真实存在的 `ddp_baseline/train.py` 和 `tests/test_train.py`。它训练的是确定性的合成二分类数据集和一个小型 MLP；它的目标是验证训练控制流，而不是测量 GPU 性能。不要运行本章以外的 `ddp_baseline.bench`、`ddp_baseline.data` 或假想的 Transformer 命令，它们不在当前项目中。
 
-## 9. 完整诊断实例：一次 DDP 训练变慢的从现象到结论
+### 9.1 这次实操要验证什么，不能验证什么
 
-### 9.1 现场与固定项
+本机 CPU 上能够验证：单进程训练、`torchrun` 启动两个 rank、Gloo collective、`DistributedSampler` 数据切分、DDP 梯度同步路径、梯度累积中的 `no_sync`、rank 0 独占写入、以及 checkpoint 的状态保存和恢复。
 
-某团队在 2 机 8 卡 DDP 上训练一个 Transformer baseline。前一天吞吐约为 1850 tokens/s，今天同一代码提交、同一数据、同一全局 batch 下降到 1120 tokens/s，且 step time 从 1.42 s 波动到 2.10--2.60 s。任务没有报错，也没有退出，只是“变慢”。
+本机 CPU 上不能验证：CUDA kernel、CUDA AMP、显存、H2D、NCCL/RDMA/网络拓扑和计算通信重叠。因此本章的 `samples_per_second` 只用于确认任务完成，不能作为 GPU 基线，更不能用于推断 NCCL 或网络性能。
 
-先固定比较条件：
+本项目的对应关系如下：
 
-```text
-实验名：slowdown-2026-09-24
-代码提交：ddp-baseline@a1b2c3d
-模型：6 层 Transformer，hidden=768，seq_len=512
-数据：同一份已预处理数据，seed=42
-全局 batch：64，每卡 batch：8，world_size=8
-精度：AMP BF16
-硬件：2 机 × 8 GPU，同型号，同驱动；节点内 NVLink，节点间 RoCE
-```
+| 训练概念 | 当前实现 |
+| --- | --- |
+| 单进程设备 | `--device cpu`，不创建进程组 |
+| CPU DDP 后端 | `torchrun` 设置 `WORLD_SIZE` 后，`configure_process_group()` 初始化 Gloo |
+| 数据分片 | `DistributedSampler(..., drop_last=True)` |
+| 梯度同步 | `DistributedDataParallel` 在同步的 `backward()` 中执行 |
+| 梯度累积 | 中间 micro-batch 使用 `model.no_sync()`，窗口末尾才同步和 `optimizer.step()` |
+| checkpoint | 模型、优化器、scheduler、scaler、每个 rank 的 RNG、epoch/batch/step 位置和配置 |
 
-记录基础信息：
+### 9.2 Step 0：进入项目并确认 CPU 环境
 
-```bash
-ps -eo pid,ppid,psr,pcpu,pmem,stat,etime,args --forest | grep -E 'torchrun|ddp_baseline'
-# 输出示例：
-# 41002 40998  3 12.4  0.8 Sl   00:47:12 torchrun --nnodes=2 --nproc_per_node=8 ...
-# 41011 41002  5 98.2  1.1 Rl   00:47:11 python -m ddp_baseline.train --rank 0 ...
-# 41012 41002  7 97.8  1.1 Rl   00:47:11 python -m ddp_baseline.train --rank 1 ...
-```
-
-同时记录 rank、PID、GPU、CPU 核、NUMA 和日志文件。这里最重要的是：**先不要调参，先收集证据**。
-
-### 9.2 第一步：用性能模型拆 step time
-
-在 warmup 30 step 后，采集 100 个稳态 step：
+从仓库根目录开始。必须用 `.venv/bin/python`，因为系统 `python` 在本环境中不存在。
 
 ```bash
-python -m ddp_baseline.bench \
-  --steps 100 --warmup 30 \
-  --output reports/slowdown-2026-09-24/baseline.json
+cd /workspace/GIT/ai_infra
+.venv/bin/python --version
+.venv/bin/python -c "import torch; print('torch=', torch.__version__); print('cuda=', torch.cuda.is_available()); print('distributed=', torch.distributed.is_available()); print('gloo=', torch.distributed.is_gloo_available())"
 ```
 
-得到：
+验收条件：`cuda=False`、`distributed=True`、`gloo=True`。如果 Gloo 为 `False`，停止后续两进程实验；重新安装带 distributed 支持的 PyTorch，而不是尝试 CUDA/NCCL 命令。
 
-| 指标 | 昨天 | 今天 |
-| --- | --- | --- |
-| tokens/s | 1850 | 1120 |
-| step time 中位数 | 1.42 s | 2.31 s |
-| 峰值显存 | 31.2 GB | 31.3 GB |
-| 每卡 batch | 8 | 8 |
-| 全局 batch | 64 | 64 |
-
-显存几乎没变，说明不是简单的 activation 或优化器状态膨胀。step time 变慢，但任务没有 OOM，也没有 NaN。按模型：
-
-```text
-T_step = T_input + T_forward + T_backward + T_optim + T_comm - T_overlap + T_wait
-```
-
-现在还不知道是哪一项变大，所以下一步看 Linux 进程和 CPU。
-
-### 9.3 第二步：Linux 进程、CPU 与 IO 证据
-
-在训练运行时执行：
+### 9.3 Step 1：先运行组件测试
 
 ```bash
-pidstat -dru -p 41011 1 10
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-关键输出片段：
+验收条件：两个测试都显示 `ok`，并以 `OK` 结束。它们覆盖：
 
-```text
-UID  PID   %usr %system  %CPU   CPU  Command
-1000 41011 18.0   2.0    20.0   5    python
-1000 41011 17.5   1.8    19.5   5    python
-...
+1. `SyntheticBinaryDataset` 在相同 seed 下生成相同数据；
+2. checkpoint 往返后模型参数、优化器和训练位置可恢复。
 
-UID  PID   kB_rd/s kB_wr/s kB_ccwr/s iodelay  Command
-1000 41011 120.0   340.0   0.0       0      python
-```
+若失败，先修复测试失败，再进行 DDP 实验；否则后面的训练完成并不能证明 checkpoint 语义正确。
 
-发现该 rank 的 `%CPU` 只有约 20%，`iodelay` 为 0，磁盘读写也不高。这说明：
+### 9.4 Step 2：运行单进程 CPU 基线
 
-- 不是 DataLoader 持续大量读盘；
-- 不是明显的 IO 等待；
-- CPU 也没有饱和。
-
-再看线程：
+下面的 batch size 是单进程的 micro-batch。`512 / 32 = 16` 个 batch，每 2 个 batch 做一次优化器更新，因此每个 epoch 有 8 个 `global_step`；两 epoch 后应为 16。输出目录使用本章专用路径，避免覆盖已有实验。
 
 ```bash
-top -H -p 41011
+.venv/bin/python -m ddp_baseline.train \
+  --device cpu --epochs 2 --samples 512 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-cpu-20260928/single
 ```
 
-输出中有一个线程持续处于 `R`，占用接近 100% 单核；其余线程大多在 `S` 或 `futex` 等待。这个现象很关键：**Python 主线程或某个 CPU 线程可能成为瓶颈，而 GPU 在等它**。
-
-同时检查 GPU 状态：
+验收条件：打印两行 JSON，`world_size` 为 1；目录中至少有 `config.json`、`metrics.jsonl`、`checkpoint.pt` 和按 step 编号的 checkpoint。查看结果：
 
 ```bash
-nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,memory.used \
-           --format=csv -l 1
+cat runs/ch9-cpu-20260928/single/metrics.jsonl
 ```
 
-观察到 8 张卡的 GPU 利用率在 35%--55% 之间波动，且时间线上有周期性空洞。到这里可以提出假设：
+这里的损失应随训练下降，但小型 CPU 实验的吞吐会受宿主机负载影响，不把它作为性能比较结论。
 
-> H1：CPU 侧某个热点导致每个 step 的输入或调度变慢，GPU 出现空洞，端到端 step time 上升。
+### 9.5 Step 3：运行两个 CPU rank 的 Gloo DDP
 
-但还需要证据。接下来用 perf 和火焰图回答“CPU 时间花在哪里”。
-
-### 9.4 第三步：perf 采样与火焰图
-
-先做 30 秒总体采样：
+`torchrun` 负责注入 `RANK`、`LOCAL_RANK`、`WORLD_SIZE` 和 rendezvous 地址。CPU 不传 `--amp`，因为本项目只在 CUDA 下启用 float16 autocast。每个 rank 的 DataLoader 收到数据的一半：每 rank 有 `512 / 2 / 32 = 8` 个 batch；累积 2 次后每 epoch 有 4 次更新，两 epoch 后 `global_step` 为 8。
 
 ```bash
-perf stat -p 41011 \
-  -e task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions \
-  -- sleep 30
+torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cpu --epochs 2 --samples 512 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-cpu-20260928/ddp
 ```
 
-输出示例：
+验收条件：命令以退出码 0 结束；rank 0 打印两行 JSON，且 `world_size` 为 2。`torchrun` 可能提示默认设置 `OMP_NUM_THREADS=1`，这是一条防止两个进程过度占用 CPU 的提示，不是失败。
 
-```text
- Performance counter stats for process id '41011':
-
-         28,412.33 msec task-clock
-            84,231      context-switches
-             3,102      cpu-migrations
-           912,344      page-faults
-     61,233,102,331      cycles
-     19,842,331,004      instructions
-```
-
-解读：
-
-- `context-switches` 和 `cpu-migrations` 相对偏高，说明线程调度和迁移较频繁；
-- IPC 约为 `19.8/61.2 ≈ 0.32`，偏低，但不能单凭 IPC 断言原因；
-- 需要调用栈才能知道是谁在占用 CPU、谁在等待。
-
-因此做短时间采样：
+核对 checkpoint 中的真实状态。这里不应期待单进程和两进程的 `global_step` 相同：固定全局样本数时，DDP 每个 optimizer step 消费更多样本，因此 DDP 的 step 数更少。
 
 ```bash
-sudo perf record -F 99 -g -p 41011 -- sleep 30
-sudo perf report --stdio | head -n 40
+.venv/bin/python -c "import torch; from pathlib import Path
+for name in ('single', 'ddp'):
+ p = Path('runs/ch9-cpu-20260928') / name / 'checkpoint.pt'
+ s = torch.load(p, map_location='cpu', weights_only=False)
+ print(name, {'epoch': s['epoch'], 'batch_in_epoch': s['batch_in_epoch'], 'global_step': s['global_step'], 'samples_seen': s['samples_seen'], 'rng_states': len(s['rng_states']), 'world_size': s['config']['world_size']})"
 ```
 
-`perf report` 中看到大量样本落在：
+预期关系：`single` 为 `global_step=16`、`rng_states=1`；`ddp` 为 `global_step=8`、`rng_states=2`；二者的 `samples_seen` 均为 1024。这说明 DDP checkpoint 收集并保存了两个 rank 各自的 RNG 状态，而非只保存 rank 0。
 
-```text
-__libc_futex
-pthread_cond_wait
-torch::distributed::ProcessGroupNCCL::wait
-...
-```
+### 9.6 Step 4：在 epoch 边界验证断点续训
 
-但真正宽的热点不止这些。继续生成火焰图：
+先完成一个 epoch，得到可恢复 checkpoint；再以完全相同的训练语义恢复到第二个 epoch。注意 `--checkpoint-dir` 不是恢复来源，`--resume` 才是；恢复后输出写到新的目录，便于检查。
 
 ```bash
-sudo perf script > reports/slowdown-2026-09-24/out.perf
-./FlameGraph/stackcollapse-perf.pl reports/slowdown-2026-09-24/out.perf \
-  > reports/slowdown-2026-09-24/out.folded
-./FlameGraph/flamegraph.pl reports/slowdown-2026-09-24/out.folded \
-  > reports/slowdown-2026-09-24/cpu-flamegraph.svg
+.venv/bin/python -m ddp_baseline.train \
+  --device cpu --epochs 1 --samples 256 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-cpu-20260928/resume-source
+
+.venv/bin/python -m ddp_baseline.train \
+  --device cpu --epochs 2 --samples 256 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-cpu-20260928/resumed \
+  --resume runs/ch9-cpu-20260928/resume-source/checkpoint.pt
 ```
 
-在火焰图中搜索 `DataLoader`、`tokenizer`、`collate`、`futex`、`all_reduce`。发现最宽的叶子之一不是 `all_reduce`，而是：
+验收条件：第二条命令先打印 `resumed from epoch 1, batch 0, step 4`，再打印 epoch 2 的指标。恢复命令的设备、样本数、模型维度、batch、累积步数、学习率、seed、AMP、warmup 和 world size 必须与保存时一致；实现会拒绝不一致的配置，避免把两个不同实验错误拼接。
 
-```text
-ddp_baseline.data.collate
-  └── ddp_baseline.data.pad_to_max_length
-        └── python list append / copy
-```
+### 9.7 Step 5：CPU 下如何做进程与卡住诊断
 
-其调用者来自 `DataLoader.__next__`，并且该路径在每个 step 都出现。再搜索 `futex`，发现它主要出现在 `ProcessGroupNCCL::wait` 下方，说明通信线程在等待，但等待的根因可能是前面 CPU 输入阶段拖延了反向和通信的发起时间。
-
-此时证据链是：
-
-- `pidstat`：无 IO 等待，CPU 未整体饱和；
-- `top -H`：单线程接近 100%；
-- `perf` + 火焰图：最宽 CPU 热点在 `pad_to_max_length` 和 Python list 拷贝；
-- GPU 利用率：有周期性空洞。
-
-这支持 H1，但仍不能完全排除通信问题。下一步用 gdb 和 profiler 确认时间线。
-
-### 9.5 第四步：gdb 判断是否 hang 或等待
-
-训练没有完全卡死，但 step time 波动大。为了确认各 rank 是否在通信处等待，选择一个疑似较慢的 rank：
+先在一个终端启动较长任务，再在另一个终端查进程。示例的输出目录可自行改为新的、未使用的目录。
 
 ```bash
-gdb -p 41011
+torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cpu --epochs 100 --samples 4096 --batch-size 32 \
+  --checkpoint-dir runs/ch9-cpu-20260928/observe
+
+ps -eo pid,ppid,psr,pcpu,pmem,stat,etime,args --forest | rg 'torchrun|ddp_baseline'
+top -H -p <rank-pid>
+```
+
+如果任务看似卡住，不要先杀进程。先保存两个 rank 的 stderr，再对每个 rank 收集栈：
+
+```bash
+gdb -p <rank-pid>
 (gdb) set pagination off
-(gdb) info threads
 (gdb) thread apply all bt
 (gdb) detach
 (gdb) quit
 ```
 
-关键栈片段示例：
+判断时看“哪个 rank 最先异常”：一个 rank 在 Python/DataLoader、另一个在 Gloo collective 等待，通常应先调查慢 rank；所有 rank 都在 collective 等待时，检查 collective 顺序和最早 stderr。CPU 的 Gloo 栈不能用来判断 NCCL、RDMA 或 GPU kernel。
 
-```text
-Thread 1 (Python main):
-#0  ddp_baseline.data.pad_to_max_length
-#1  ddp_baseline.data.collate
-#2  torch.utils.data._utils.fetch._MapDatasetFetcher.fetch
-...
-
-Thread 7 (NCCL):
-#0  pthread_cond_wait
-#1  torch::distributed::ProcessGroupNCCL::wait
-#2  torch::distributed::ProcessGroupNCCL::allreduce
-...
-```
-
-这个组合说明：
-
-- 主线程还在做数据 collate；
-- NCCL 线程在等待 collective 完成或等待被调用；
-- 不是所有 rank 都卡在通信库内部无法推进，而是某个 rank 的输入阶段拖慢了整体节奏。
-
-如果看到“所有 rank 都停在 `ProcessGroupNCCL::wait`，且没有任何 rank 在输入或计算”，才更倾向于 collective 顺序不一致或某 rank 先失败。当前证据更支持“输入侧拖慢导致 GPU 空洞”。
-
-### 9.6 第五步：PyTorch Profiler 看 GPU/NPU 时间线
-
-用 PyTorch Profiler 采集稳态 10 个 step：
-
-```python
-from torch.profiler import profile, ProfilerActivity, schedule
-
-with profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    schedule=schedule(wait=5, warmup=5, active=10, repeat=1),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler(
-        "reports/slowdown-2026-09-24/trace"
-    ),
-    record_shapes=True,
-    profile_memory=True,
-    with_stack=True,
-) as prof:
-    for step, batch in enumerate(loader):
-        if step >= 25:
-            break
-        train_step(batch)
-        prof.step()
-```
-
-在 TensorBoard 或 Chrome trace 中观察四个问题：
-
-1. GPU 时间线上是否存在明显空洞？
-   - 有。每个 step 开头有约 200--400 ms 的空洞，正好对应 DataLoader 取数和 collate。
-2. 反向阶段的 collectives 出现在何处，是否同计算 stream 重叠？
-   - all-reduce 出现在反向后期，与部分反向计算有重叠，但重叠窗口被输入空洞拉长。
-3. 最长 kernel/算子是什么，调用次数是否异常？
-   - 最长 kernel 仍是 GEMM，调用次数与昨天一致，没有异常增长。
-4. H2D、allocator、checkpoint 或同步是否落在关键路径？
-   - H2D 拷贝时间正常；checkpoint 没有出现在采集窗口；allocator 没有明显抖动。
-
-因此 profiler 的证据与火焰图一致：**关键路径上的空洞主要来自 CPU 输入阶段，而不是 GPU kernel 变慢或通信库本身变慢。**
-
-### 9.7 第六步：NCCL/HCCL 与网络链路验证
-
-虽然 profiler 已指向输入侧，但仍要按文档排除通信问题。先开有限范围日志：
+本机没有安装 `pidstat` 与 `perf`，因此本次没有生成伪造的 CPU 使用率、火焰图或 perf 数字。若目标机器安装了 `sysstat` 和 perf，可在训练运行期间追加：
 
 ```bash
-NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET \
-  torchrun --standalone --nproc_per_node=8 -m ddp_baseline.train \
-  --device cuda --amp --epochs 1 --samples 2048 --batch-size 8 \
-  2> reports/slowdown-2026-09-24/nccl.log
+pidstat -dru -p <rank-pid> 1 10
+perf stat -p <rank-pid> -e task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions -- sleep 30
 ```
 
-检查日志中的关键信息：
+将 PID、时间窗口、完整输出和当时的训练命令一同保存；不要把一次 CPU 采样解释为 GPU 或网络瓶颈。
 
-```text
-NCCL INFO NET/IB : Using [0]mlx5_0:1/RoCE
-NCCL INFO Channel 00/08 : 0[0] -> 1[1] -> ...
-NCCL INFO Ring 00 : 0[0] -> 1[1] -> ...
-```
+### 9.8 本次 CPU 执行记录（2026-09-28）
 
-确认：
+以下不是示例数据，而是在本仓库、当前 CPU 环境实际执行的记录。数值中的吞吐受共享 CPU 负载影响，只作为任务完成证据。
 
-- NCCL 使用的是 RoCE，不是 TCP fallback；
-- 网卡选择与拓扑符合预期；
-- 没有出现 `NET/IB : No device found` 或 `Failed to initialize`；
-- 各 rank 的 collective 顺序一致。
-
-再看网络计数器：
-
-```bash
-ip -br addr
-ip route
-ss -tanp | grep -E '41011|41012'
-ethtool -S mlx5_0 | grep -E 'rx_discards|tx_errors|rx_pause|tx_pause'
-ping -c 20 <peer-ip>
-```
-
-结果：
-
-- `ping` 延迟正常；
-- RoCE 网卡没有明显丢包或 pause 增长；
-- `ss` 中连接状态正常；
-- 没有发现端口或防火墙异常。
-
-这一步的结论是：
-
-> 通信链路没有明显故障；NCCL 日志和网络计数器不支持“网络瓶颈”假设。
-
-### 9.8 第七步：只改一个变量并复现
-
-根据证据，唯一改动是优化 `pad_to_max_length`：把 Python 逐样本 pad 改为按 batch 预分配张量并向量化填充。固定其他所有条件，重复三次取中位数：
-
-| 实验 | 改动 | tokens/s 中位数 | step time 中位数 | GPU 利用率 |
-| --- | --- | --- | --- | --- |
-| baseline-2026-09-24 | 无 | 1120 | 2.31 s | 35%--55% |
-| opt-collate | 向量化 collate | 1790 | 1.45 s | 78%--88% |
-| opt-collate-repeat | 同上，重复三次 | 1810 | 1.43 s | 80%--90% |
-
-再次采集火焰图，最宽叶子从 `pad_to_max_length` 转移到正常的 Python 调度和 NCCL wait，且 NCCL wait 的宽度下降。profiler 中 GPU 空洞从 200--400 ms 降到 20--50 ms。
-
-最终结论：
-
-- 现象：DDP 训练变慢，GPU 利用率下降，step time 上升。
-- 证据：`pidstat` 无 IO 等待；`top -H` 单线程接近 100%；火焰图显示 `pad_to_max_length` 为最宽 CPU 热点；gdb 显示主线程在 collate、NCCL 线程在等待；profiler 显示 GPU 时间线有输入导致的空洞；NCCL 日志和网络计数器未发现通信故障。
-- 假设：CPU 输入阶段变慢导致 GPU 空洞，而非网络或 GPU kernel 变慢。
-- 唯一改动：向量化 collate。
-- 结果：吞吐从 1120 恢复到 1790--1810 tokens/s，step time 回到 1.43--1.45 s。
-- 回归风险：需要检查向量化 pad 后的 mask、position ids 和数值一致性。
-- 是否保留：保留，并补充单元测试与端到端回归。
-
-### 9.9 这个例子用到了文档中的哪些知识点
-
-| 文档知识点 | 例子中的使用 |
+| 项目 | 实际结果 |
 | --- | --- |
-| 性能模型 `T_step` | 先拆 step time，不直接猜网络 |
-| samples/s、step time、显存、scaling efficiency | 用吞吐和 step time 作为主指标 |
-| `ps`、`top -H`、`pidstat`、NUMA | 发现单线程热点与无 IO 等待 |
-| perf stat / perf record | 采集 CPU 总体指标和调用栈 |
-| 火焰图 | 找到 `pad_to_max_length` 这个最宽叶子 |
-| gdb | 判断主线程在 collate、NCCL 线程在等待 |
-| PyTorch Profiler | 看 GPU 时间线空洞、collective 位置和关键路径 |
-| NCCL 日志与网络计数器 | 排除通信链路故障 |
-| 只改一个变量、重复三次取中位数 | 验证向量化 collate 的收益 |
-| 结论写成“现象、证据、假设、改动、结果、风险” | 形成可复现的诊断报告 |
+| Python | `.venv/bin/python`，Python 3.10.12 |
+| PyTorch | 2.14.0+cu130 |
+| CUDA | `False` |
+| distributed / Gloo | `True` / `True` |
+| 组件测试 | 2 passed：dataset 可复现、checkpoint 往返恢复 |
+| 单进程训练 | epoch 1：loss 0.686563，11895.22 samples/s；epoch 2：loss 0.665828，21634.23 samples/s |
+| 两进程 Gloo DDP | epoch 1：loss 0.690397，13966.15 samples/s；epoch 2：loss 0.676618，46621.69 samples/s |
+| 恢复来源 | epoch 1 完成，step 4，samples_seen 256 |
+| 恢复后训练 | 从 `epoch 1, batch 0, step 4` 恢复，完成 epoch 2：loss 0.680191，8291.43 samples/s |
+| 单进程 checkpoint | epoch 2，step 16，samples_seen 1024，1 个 RNG state |
+| 两进程 checkpoint | epoch 2，step 8，samples_seen 1024，2 个 RNG states |
+| 诊断工具限制 | `perf`、`pidstat` 未安装；未执行 GPU profiler、NCCL 或网络测试 |
 
-这个例子的核心不是“最后改了什么代码”，而是：**每一步都让证据决定下一步，而不是让猜测决定调参。** 火焰图、gdb、profiler、NCCL 日志和网络计数器各自回答不同问题，只有把它们放在同一条证据链上，才能把“训练变慢”从模糊现象变成可复现、可验证的结论。
+实际生成物位于 `runs/ch9-cpu-20260928/`：`single/`、`ddp/`、`resume-source/` 与 `resumed/` 各包含 config、metrics 和 checkpoint，可用于复查本章记录。
+
+### 9.9 GPU 完整实操：CUDA、AMP、NCCL DDP、恢复与诊断
+
+本节必须在一台至少有两张可见 NVIDIA GPU 的机器上执行。本次 CPU 环境没有 GPU，以下命令尚未在本仓库执行；执行后应将真实输出补到本节末尾的证据表，不能复用第 9.8 节的 CPU/Gloo 结果。
+
+本项目的 GPU 路径是固定的：`--device cuda` 使每个 `torchrun` rank 按 `LOCAL_RANK` 绑定一张 GPU，使用 NCCL 初始化进程组；`--amp` 才启用 CUDA float16 autocast 和 `GradScaler`。若 CUDA 不可用，程序会报错，不会回退到 CPU。
+
+#### 9.9.1 Step 0：GPU 环境预检
+
+进入仓库和 GPU 的 Python 环境。以下检查全部通过才能继续：`nvidia-smi` 能显示设备，PyTorch 可见至少两张卡，且 NCCL 可用。
+
+```bash
+cd /workspace/GIT/ai_infra
+.venv/bin/python -m unittest discover -s tests -v
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
+nvidia-smi topo -m
+.venv/bin/python -c "import torch; import torch.distributed as dist; print({'torch': torch.__version__, 'cuda_build': torch.version.cuda, 'cuda_available': torch.cuda.is_available(), 'device_count': torch.cuda.device_count(), 'nccl_available': dist.is_nccl_available(), 'nccl_version': torch.cuda.nccl.version() if dist.is_nccl_available() else None})"
+```
+
+验收条件：组件测试通过；`cuda_available=True`、`device_count >= 2`、`nccl_available=True`。记录 GPU 型号、显存、驱动、`torch`、CUDA build、NCCL 版本和 `nvidia-smi topo -m` 输出。若只有一张卡，完成 9.9.2 的单卡流程，不执行 9.9.3 的双卡 DDP。
+
+#### 9.9.2 Step 1：单卡 CUDA + AMP 基线
+
+先跑单卡，隔离模型、数据、CUDA AMP 与 checkpoint；这一步成功不代表 NCCL 已验证。`--nproc_per_node=1` 仍使用 `torchrun`，但不会创建多 rank 的进程组。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m ddp_baseline.train \
+  --device cuda --amp --epochs 2 --samples 512 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-gpu-<date>/single
+
+cat runs/ch9-gpu-<date>/single/config.json
+cat runs/ch9-gpu-<date>/single/metrics.jsonl
+```
+
+验收条件：退出码为 0，输出两行 `world_size: 1` 的指标；`config.json` 中 `device` 为 `cuda`、`amp` 为 `true`、`world_size` 为 1。目录中存在 `checkpoint.pt` 和带 step 编号的 checkpoint。单卡每个 epoch 有 `512 / 32 / 2 = 8` 次 optimizer step；两 epoch 后 checkpoint 的 `global_step` 应为 16，`samples_seen` 应为 1024。
+
+在另一个终端、训练仍在运行时观察一次显存和利用率。短小 MLP 可能只使用很少显存且利用率波动很大，这不是故障。
+
+```bash
+nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total \
+  --format=csv -l 1
+```
+
+#### 9.9.3 Step 2：两卡 NCCL DDP + AMP
+
+确认 0、1 两张卡未被其他任务占用后执行。`--batch-size 32` 是**每 rank** micro-batch；两个 rank 的每次同步 micro-batch 是 `2 * 32 = 64` 个样本，累积两次后的有效全局 batch 是 `128`。它与单卡流程的有效 batch 64 不同，不能直接比较 loss 曲线或吞吐来判断“DDP 加速”。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 2 --samples 512 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-gpu-<date>/ddp
+```
+
+验收条件：退出码为 0；rank 0 输出两个 `world_size: 2` 的指标；只有 rank 0 写入 `config.json`、`metrics.jsonl` 和 checkpoint。每个 rank 每 epoch处理 8 个 batch，累积两次后有 4 个 optimizer step；两 epoch后 checkpoint 的 `global_step` 应为 8、`samples_seen` 应为 1024、`rng_states` 长度应为 2。
+
+用下面命令读取 checkpoint，而不是凭终端输出猜测：
+
+```bash
+.venv/bin/python -c "import torch; from pathlib import Path
+for name in ('single', 'ddp'):
+ p = Path('runs/ch9-gpu-<date>') / name / 'checkpoint.pt'
+ s = torch.load(p, map_location='cpu', weights_only=False)
+ print(name, {'device': s['config']['device'], 'amp': s['config']['amp'], 'world_size': s['config']['world_size'], 'epoch': s['epoch'], 'global_step': s['global_step'], 'samples_seen': s['samples_seen'], 'rng_states': len(s['rng_states'])})"
+```
+
+不要比较单卡和双卡 checkpoint 的参数是否完全相等：两种运行的每次更新样本组成和更新次数不同。这里要验证的是每个运行内部的配置、step 和 rank RNG 状态一致。
+
+#### 9.9.4 Step 3：在 CUDA + AMP 下验证断点续训
+
+恢复必须使用与来源相同的 device、AMP、world size、模型、数据、batch、累积步数、学习率、seed 和 warmup；当前实现会显式拒绝不一致的配置。先完成一 epoch，再恢复到第二 epoch：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 1 --samples 256 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 2 \
+  --checkpoint-dir runs/ch9-gpu-<date>/resume-source
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 2 --samples 256 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 2 \
+  --checkpoint-dir runs/ch9-gpu-<date>/resumed \
+  --resume runs/ch9-gpu-<date>/resume-source/checkpoint.pt
+```
+
+验收条件：恢复命令打印 `resumed from epoch 1, batch 0, step 2`，并完成 epoch 2；`resumed/checkpoint.pt` 的 `epoch=2`、`global_step=4`、`samples_seen=512`、`rng_states=2`。这同时验证模型、优化器、scheduler、CUDA AMP scaler 和两个 rank 的 RNG 恢复路径。
+
+#### 9.9.5 Step 4：做可比较的单卡与双卡吞吐实验
+
+性能实验必须固定**有效全局 batch**，并分别重复至少三次。为使两种运行都是有效全局 batch 128，可用：单卡 `batch-size=32, accumulation-steps=4`；双卡 `batch-size=32, accumulation-steps=2`。合成 MLP 太小，得到的数字只练习测量流程，不代表真实模型扩展效率。
+
+```bash
+# 单卡：有效全局 batch = 1 * 32 * 4 = 128。将末尾目录依次改为 perf-single-1、perf-single-2、perf-single-3，完整执行三次。
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -f 'elapsed=%e s' torchrun --standalone --nproc_per_node=1 -m ddp_baseline.train \
+  --device cuda --amp --epochs 10 --samples 8192 --batch-size 32 --accumulation-steps 4 \
+  --checkpoint-every-steps 1000 --checkpoint-dir runs/ch9-gpu-<date>/perf-single-1
+
+# 双卡：有效全局 batch = 2 * 32 * 2 = 128。将末尾目录依次改为 perf-ddp-1、perf-ddp-2、perf-ddp-3，完整执行三次。
+CUDA_VISIBLE_DEVICES=0,1 /usr/bin/time -f 'elapsed=%e s' torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 10 --samples 8192 --batch-size 32 --accumulation-steps 2 \
+  --checkpoint-every-steps 1000 --checkpoint-dir runs/ch9-gpu-<date>/perf-ddp-1
+```
+
+把每次终端的 `elapsed` 和每个目录最后一行 `metrics.jsonl` 记录为表格，取中位数。强扩展效率公式为 `throughput_2 / (2 * throughput_1)`。不要跨实验目录拼接指标；每次命令都使用新目录，避免旧 metrics 文件污染结果。
+
+#### 9.9.6 Step 5：采集 GPU、CPU 与 NCCL 的诊断证据
+
+先运行一次短小的双卡任务，并把标准输出和标准错误完整保留。`NCCL_DEBUG` 日志可能包含接口、主机和拓扑信息，不要提交到公开仓库。
+
+```bash
+mkdir -p reports/ch9-gpu-<date>
+CUDA_VISIBLE_DEVICES=0,1 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET \
+  torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 2 --samples 512 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 4 \
+  --checkpoint-dir runs/ch9-gpu-<date>/nccl-log \
+  2>&1 | tee reports/ch9-gpu-<date>/nccl-ddp.log
+
+nvidia-smi topo -m | tee reports/ch9-gpu-<date>/topology.txt
+```
+
+验收条件不是“日志中一定出现 Ring”或某个固定网卡名，而是：所有 rank 正常退出；日志没有 `unhandled system error`、`connection refused`、`Failed to initialize` 或 `Watchdog caught collective operation timeout`；记录 NCCL 最终选用的 transport/拓扑信息。NCCL 会随硬件和版本选择不同算法。
+
+若任务卡住，保留日志，再取得 launcher 和每个 rank 的 PID：
+
+```bash
+ps -eo pid,ppid,psr,pcpu,pmem,stat,etime,args --forest | rg 'torchrun|ddp_baseline'
+top -H -p <rank-pid>
+gdb -p <rank-pid>
+(gdb) set pagination off
+(gdb) thread apply all bt
+(gdb) detach
+(gdb) quit
+```
+
+排查顺序：先找最早退出或报错的 rank；再看其他 rank 是否在 `ProcessGroupNCCL` 等待；最后核对同一训练循环中是否有条件分支导致 collective 次数或张量形状不一致。不要先设置 `NCCL_IB_DISABLE`、`NCCL_P2P_DISABLE` 或强设网卡作为“修复”；它们只能作为单独记录的隔离实验。
+
+#### 9.9.7 Step 6：用 profiler 看 GPU 时间线
+
+当前 `ddp_baseline.train` **没有** `--profile` 参数，也没有调用 `torch.profiler`，所以不能假装运行一个不存在的 profiler CLI。可先用 Nsight Systems 对一个短任务采集 CUDA API、kernel、memcpy 和 NCCL 时间线；确认本机安装 `nsys` 后执行：
+
+```bash
+nsys --version
+mkdir -p reports/ch9-gpu-<date>
+CUDA_VISIBLE_DEVICES=0,1 nsys profile --trace=cuda,nvtx,osrt --sample=none \
+  --force-overwrite true -o reports/ch9-gpu-<date>/ddp-timeline \
+  torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 2 --samples 2048 --batch-size 32 \
+  --accumulation-steps 2 --checkpoint-every-steps 1000 \
+  --checkpoint-dir runs/ch9-gpu-<date>/nsys
+```
+
+如果 Nsight 版本只跟踪 launcher 而没有跟踪 torchrun 子进程，使用该版本文档规定的 child-process tracing 选项，或直接 profile 某个 rank；不要把一个没有 CUDA/NCCL event 的 report 当作训练时间线。打开报告后，逐项回答：GPU 是否有空洞；空洞前 CPU/加载/同步事件是什么；backward 的 NCCL collective 是否与后续 kernel 重叠；最长 kernel 和 memcpy 是否在关键路径。小 MLP 的时间线极短，主要用于熟悉工具，不足以推导真实大模型的 MFU 或扩展效率。
+
+若需要可重复的 PyTorch trace，下一步是在 `train.py` 增加显式 profiler schedule、`prof.step()` 和 `tensorboard_trace_handler`；这是代码改动，不能用本章现有命令替代。
+
+#### 9.9.8 GPU 证据记录模板
+
+每次 GPU 实验建立一个新日期目录，并将下表填为真实值：
+
+| 项目 | 必填记录 |
+| --- | --- |
+| 环境 | 主机、Git commit、GPU/显存/驱动、PyTorch、CUDA、NCCL、`CUDA_VISIBLE_DEVICES` |
+| 命令 | 完整 `torchrun` 命令、环境变量、开始/结束时间、退出码 |
+| 训练语义 | world size、每卡 batch、累积步数、有效全局 batch、AMP、seed、samples、epoch |
+| 正确性 | `metrics.jsonl`、checkpoint 的 epoch/step/samples/RNG state 数、恢复结果 |
+| 性能 | 每次 samples/s、墙钟时间、中位数、单卡与双卡强扩展效率 |
+| 拓扑与通信 | `nvidia-smi topo -m`、NCCL 日志路径、是否存在错误/超时 |
+| profiler | trace/report 路径、GPU 空洞、collective 重叠、关键路径结论 |
+| 结论 | 现象、证据、唯一改动、结果、回归风险；无证据时写“待验证” |
