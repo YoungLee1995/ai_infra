@@ -422,6 +422,10 @@ nvidia-smi topo -m
 验收条件：组件测试通过；`cuda_available=True`、`device_count >= 2`、`nccl_available=True`。记录 GPU 型号、显存、驱动、`torch`、CUDA build、NCCL 版本和 `nvidia-smi topo -m` 输出。若只有一张卡，完成 9.9.2 的单卡流程，不执行 9.9.3 的双卡 DDP。
 
 #### 9.9.2 Step 1：单卡 CUDA + AMP 基线
+国产卡适配
+NCCL 为 NVIDIA 专有，国产卡不能直接用，需换对应通信库：昇腾→HCCL，寒武纪→CNCL，海光→RCCL（ROCm 生态，API 兼容 NCCL）。
+技能迁移结论
+核心技能变化不大：分布式训练思路、PyTorch DDP 代码骨架、调优方法论均通用，主要改 backend 名字与 torch 插件。需更换的部分：环境检查命令（nvidia-smi→npu-smi/cnmon）、后端（nccl→hccl/cncl/rccl）、算子与精度兼容、通信库稳定性与性能调优。一句话：同一套方法论，换一套工具，门槛在新硬件生态的适配与排障。
 
 先跑单卡，隔离模型、数据、CUDA AMP 与 checkpoint；这一步成功不代表 NCCL 已验证。`--nproc_per_node=1` 仍使用 `torchrun`，但不会创建多 rank 的进程组。
 
