@@ -10,12 +10,12 @@
 
 ## 0. 路线、资源与材料
 
-Qwen3-8B 的 BF16 权重约 16 GB；全参数 AdamW 还需要梯度、master weight、优化器状态和激活，**不是一张 24/48 GB 卡的常规实验**。默认路线是 Qwen3-8B **BF16 + LoRA SFT**，用它测吞吐、数据加载、DDP 通信、梯度累积和 checkpoint。
+Qwen3-8B 的 BF16 权重约 16 GB；全参数 AdamW 还需要梯度、master weight、优化器状态和激活，**不适合你的 24 GB 单卡**。你的默认路线应是 Qwen3-8B **4-bit QLoRA + 两卡 DDP**，用它测吞吐、数据加载、梯度累积和 checkpoint。BF16 LoRA只作为一次显存探测，不作为主基线。
 
 | 机器条件 | 默认配置 | 结论边界 |
 |---|---|---|
-| 1 x 24 GB | 4-bit QLoRA，`seq_len=512`，`batch=1` | 不做 DDP/ZeRO 通信结论 |
-| 1 x 48 GB | BF16 LoRA，`seq_len=512`，`batch=1` | 单卡结果不代表 DDP |
+| 1 x 24 GB | 4-bit QLoRA，`seq_len=512`，`batch=1` | 不做 DDP 通信结论 |
+| **2 x 24 GB 4090（你的配置）** | **4-bit QLoRA + DDP，`seq_len=512`，`batch=1`，`grad_accum=8`** | **通信只覆盖 LoRA 梯度，不能外推到全参训练** |
 | 2 x 48 GB 或以上 | BF16 LoRA + DDP | LoRA 优化器状态很小，ZeRO 通常无收益 |
 | 4 x 80 GB 或以上 | 可选 BF16 全参 + ZeRO-2/3 | 需单独写全参结论 |
 
@@ -82,7 +82,7 @@ print('devices=', torch.cuda.device_count())
 PY
 ```
 
-**通过标准**：`cuda=True`、`qwen3_config=True` 且卡数与 `nvidia-smi` 一致。仅在 QLoRA 分支安装 `bitsandbytes>=0.45.0`；仅在全参 ZeRO 分支安装 `deepspeed>=0.16.0`。
+**通过标准**：`cuda=True`、`qwen3_config=True` 且卡数为 2。你的 4090 必须使用 CUDA 版 PyTorch；安装 `bitsandbytes>=0.45.0`。仅在全参 ZeRO 分支安装 `deepspeed>=0.16.0`。
 
 ## Step 3：下载模型并固定数据切片
 
@@ -145,7 +145,7 @@ PY
 
 1. `--model-path` 只从本地加载；使用 `AutoTokenizer`、`AutoModelForCausalLM`、`use_cache=False`。
 2. 用 `apply_chat_template(..., add_generation_prompt=False)` 格式化数据；非 assistant token 的 label 设为 `-100`。
-3. 默认 BF16 LoRA：`r=16`、`lora_alpha=32`、`lora_dropout=0.05`，target modules 为 `q/k/v/o/gate/up/down_proj`。
+3. 默认 4-bit QLoRA：`BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)`，再挂载 LoRA；`r=16`、`lora_alpha=32`、`lora_dropout=0.05`，target modules 为 `q/k/v/o/gate/up/down_proj`。保留 `--precision bf16` 作为显存探测分支。
 4. 支持 `--steps`、`--warmup-steps`、`--batch-size`、`--seq-len`、`--grad-accum`、`--num-workers`、`--pin-memory`、`--persistent-workers`、`--profile`、`--checkpoint-every`、`--async-checkpoint`。
 5. 每个 optimizer step 记录 `step_time_ms`、`tokens_per_second`、loss、峰值显存到 JSONL；只由 rank 0 写文件。
 6. DDP 使用 `DistributedSampler.set_epoch()`；除最后一个 micro-batch 外使用 `model.no_sync()`，loss 必须除以 `grad_accum`。
@@ -157,7 +157,7 @@ python -m py_compile "$PROJECT_ROOT/src/train_qwen3_lora.py"
 
 不要把第 1 阶段的 MLP 结果当作 Qwen3 证据；可复用其 DDP/checkpoint 控制流，但 tokenizer、causal loss、序列长度和显存必须由本脚本实测。
 
-## Step 5：单卡 BF16 LoRA 冒烟
+## Step 5：单卡 QLoRA 冒烟
 
 ```bash
 export GPU_ID=0
@@ -166,21 +166,23 @@ cd "$PROJECT_ROOT"
 CUDA_VISIBLE_DEVICES="$GPU_ID" python src/train_qwen3_lora.py \
   --model-path "$MODEL_DIR/Qwen3-8B" \
   --data-path artifacts/data/ultrachat-2000.jsonl --output-dir artifacts/smoke \
-  --precision bf16 --batch-size 1 --seq-len 512 --grad-accum 1 \
+  --load-in-4bit --bnb-4bit-quant-type nf4 --bnb-4bit-compute-dtype bf16 \
+  --batch-size 1 --seq-len 512 --grad-accum 1 --gradient-checkpointing \
   --steps 8 --warmup-steps 2 --num-workers 2 --pin-memory
 ```
 
-**通过标准**：8 step 无 OOM、loss 有限、`metrics.jsonl` 有 8 行。OOM 时只按顺序改一个变量：`seq_len 512 -> 256`、开启 gradient checkpointing，最后转 Step 9 QLoRA；不要同时改多个变量。
+**通过标准**：8 step 无 OOM、loss 有限、`metrics.jsonl` 有 8 行。OOM 时只按顺序改一个变量：`seq_len 512 -> 256`，再降低 `grad_accum`（不改变单卡显存），不要同时改多个变量。
 
 ## Step 6：建立 baseline 和 profiler 证据
 
-固定模型目录、数据文件、seed、序列长度、global batch、GPU 数和软件版本：
+固定模型目录、数据文件、seed、序列长度、global batch、GPU 数和软件版本。你的主 baseline 使用两张 4090、QLoRA、`batch=1`、`grad_accum=8`：
 
 ```bash
-CUDA_VISIBLE_DEVICES="$GPU_ID" python src/train_qwen3_lora.py \
+CUDA_VISIBLE_DEVICES="0,1" torchrun --standalone --nproc_per_node=2 src/train_qwen3_lora.py \
   --model-path "$MODEL_DIR/Qwen3-8B" \
   --data-path artifacts/data/ultrachat-2000.jsonl --output-dir artifacts/baseline \
-  --precision bf16 --batch-size 1 --seq-len 512 --grad-accum 1 \
+  --load-in-4bit --bnb-4bit-quant-type nf4 --bnb-4bit-compute-dtype bf16 \
+  --batch-size 1 --seq-len 512 --grad-accum 8 --gradient-checkpointing \
   --steps 40 --warmup-steps 10 --num-workers 2 --pin-memory \
   --profile --profile-wait 5 --profile-warmup 5 --profile-active 20
 ```
@@ -198,7 +200,8 @@ tensorboard --logdir "$PROJECT_ROOT/artifacts/baseline" --port 6006
 ```bash
 export TRAIN_COMMON=(--model-path "$MODEL_DIR/Qwen3-8B"
   --data-path artifacts/data/ultrachat-2000.jsonl
-  --precision bf16 --batch-size 1 --seq-len 512 --warmup-steps 10
+  --load-in-4bit --bnb-4bit-quant-type nf4 --bnb-4bit-compute-dtype bf16
+  --batch-size 1 --seq-len 512 --grad-accum 8 --gradient-checkpointing --warmup-steps 10
   --steps 40)
 ```
 
@@ -231,7 +234,8 @@ export GPU_IDS=0,1
 CUDA_VISIBLE_DEVICES="$GPU_IDS" torchrun --standalone --nproc_per_node=2 \
   src/train_qwen3_lora.py --model-path "$MODEL_DIR/Qwen3-8B" \
   --data-path artifacts/data/ultrachat-2000.jsonl --output-dir artifacts/ddp-smoke \
-  --precision bf16 --batch-size 1 --seq-len 512 --grad-accum 1 \
+  --load-in-4bit --bnb-4bit-quant-type nf4 --bnb-4bit-compute-dtype bf16 \
+  --batch-size 1 --seq-len 512 --grad-accum 8 --gradient-checkpointing \
   --steps 8 --warmup-steps 2 --num-workers 2 --pin-memory
 ```
 
@@ -248,19 +252,20 @@ CUDA_VISIBLE_DEVICES="$GPU_IDS" torchrun --standalone --nproc_per_node=2 \
 
 报告 `artifacts/reports/day12-comm-overlap.md`：两组稳定段指标、`nccl:all_reduce` 与 backward 的重叠、trace 路径。LoRA 通信量很小导致收益不明显时，要如实记录。
 
-## Step 9：显存分支
+## Step 9：显存分支与 BF16 探测
 
-先单独测 activation checkpointing：
+你的主路线已经是 QLoRA。若想知道 BF16 LoRA 是否能在 24GB 卡上运行，可单独做一次探测；失败是预期结果：
 
 ```bash
-CUDA_VISIBLE_DEVICES="$GPU_ID" python src/train_qwen3_lora.py "${TRAIN_COMMON[@]}" \
-  --output-dir artifacts/grad-checkpointing --gradient-checkpointing
+CUDA_VISIBLE_DEVICES="$GPU_ID" python src/train_qwen3_lora.py \
+  --model-path "$MODEL_DIR/Qwen3-8B" --data-path artifacts/data/ultrachat-2000.jsonl \
+  --output-dir artifacts/bf16-probe --precision bf16 --batch-size 1 --seq-len 256 \
+  --grad-accum 8 --gradient-checkpointing --steps 2
 ```
 
-仍 OOM 时安装 bitsandbytes 并使用 QLoRA：
+若 BF16 探测 OOM，继续使用 Step 5/6 的 QLoRA 配置。QLoRA 命令如下：
 
 ```bash
-pip install 'bitsandbytes>=0.45.0'
 CUDA_VISIBLE_DEVICES="$GPU_ID" python src/train_qwen3_lora.py "${TRAIN_COMMON[@]}" \
   --output-dir artifacts/qlora --load-in-4bit --bnb-4bit-quant-type nf4 \
   --bnb-4bit-compute-dtype bf16 --gradient-checkpointing
