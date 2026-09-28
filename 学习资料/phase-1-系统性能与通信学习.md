@@ -347,22 +347,27 @@ for name in ('single', 'ddp'):
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
-  --device cpu --epochs 100 --samples 4096 --batch-size 32 \
+  --device cpu --epochs 10000 --samples 4096 --batch-size 32 \
   --checkpoint-dir runs/ch9-cpu-20260928/observe
 
 ps -eo pid,ppid,psr,pcpu,pmem,stat,etime,args --forest | rg 'torchrun|ddp_baseline'
-top -H -p <rank-pid>
+top -H -p 3770253
 ```
 
-如果任务看似卡住，不要先杀进程。先保存两个 rank 的 stderr，再对每个 rank 收集栈：
+所以下一步应该是：
+用 perf 采样这个 PID，看主线程在哪个函数上；
+生成火焰图，找最宽的叶子；
+再用 PyTorch Profiler 看 GPU/NPU 时间线是否有空洞。
+cd /workspace/GIT/ai_infra
+perf record -F 99 -g -p 3770253 -- sleep 20
+perf要求权限较高，可用下面的代替
+pip install py-spy
+py-spy top --pid 3770253
 
-```bash
-gdb -p <rank-pid>
-(gdb) set pagination off
-(gdb) thread apply all bt
-(gdb) detach
-(gdb) quit
-```
+py-spy top 是实时排行，要拿到完整火焰图用：
+bash
+py-spy record -o profile.svg --pid 3770253 --duration 30
+产生的svg文件在根目录，下载后用浏览器打开
 
 判断时看“哪个 rank 最先异常”：一个 rank 在 Python/DataLoader、另一个在 Gloo collective 等待，通常应先调查慢 rank；所有 rank 都在 collective 等待时，检查 collective 顺序和最早 stderr。CPU 的 Gloo 栈不能用来判断 NCCL、RDMA 或 GPU kernel。
 
