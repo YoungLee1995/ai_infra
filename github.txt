@@ -1,6 +1,6 @@
 ssh -T git@github-personal
 git add .
-git commit -m "feat: update phase1 learning plan"
+git commit -m "feat: update phase2 learning plan"
 git push
 
 git remote set-url origin git@github-personal:YoungLee1995/scientific-agent-skills.git
