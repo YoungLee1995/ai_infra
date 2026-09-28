@@ -420,7 +420,7 @@ nvidia-smi topo -m
 ```
 
 验收条件：组件测试通过；`cuda_available=True`、`device_count >= 2`、`nccl_available=True`。记录 GPU 型号、显存、驱动、`torch`、CUDA build、NCCL 版本和 `nvidia-smi topo -m` 输出。若只有一张卡，完成 9.9.2 的单卡流程，不执行 9.9.3 的双卡 DDP。
-
+GPU 型号：2×NVIDIA GeForce RTX 4090；显存：GPU0 24564 MiB、GPU1 23028 MiB；驱动：550.120；torch：2.5.1+cu124；CUDA build：12.4；cuda_available：True；device_count：2；nccl_available：True；NCCL 版本：(2, 21, 5)；nvidia-smi topo -m：GPU0-GPU1 为 SYS，GPU0-NIC0 为 NODE，GPU0-NIC1 为 NODE，GPU1-NIC0 为 SYS，GPU1-NIC1 为 SYS，NIC0-NIC1 为 PIX，GPU0 CPU Affinity 为 0-95,192-287、NUMA Affinity 为 0，GPU1 CPU Affinity 为 96-191,288-383、NUMA Affinity 为 1，GPU NUMA ID 均为 N/A，NIC0 为 mlx5_0、NIC1 为 mlx5_1。
 #### 9.9.2 Step 1：单卡 CUDA + AMP 基线
 国产卡适配
 NCCL 为 NVIDIA 专有，国产卡不能直接用，需换对应通信库：昇腾→HCCL，寒武纪→CNCL，海光→RCCL（ROCm 生态，API 兼容 NCCL）。
@@ -431,12 +431,17 @@ NCCL 为 NVIDIA 专有，国产卡不能直接用，需换对应通信库：昇�
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m ddp_baseline.train \
-  --device cuda --amp --epochs 2 --samples 512 --batch-size 32 \
+  --device cuda --amp --epochs 1000 --samples 4096 --batch-size 256 \
   --accumulation-steps 2 --checkpoint-every-steps 4 \
-  --checkpoint-dir runs/ch9-gpu-<date>/single
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/single
+提高利用率测试
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m ddp_baseline.train \
+  --device cuda --amp --epochs 50 --samples 500000 --batch-size 512 \
+  --accumulation-steps 1 --checkpoint-every-steps 1000 \
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/single
 
-cat runs/ch9-gpu-<date>/single/config.json
-cat runs/ch9-gpu-<date>/single/metrics.jsonl
+cat runs/ch9-gpu-$(date +%F)/single/config.json
+cat runs/ch9-gpu-$(date +%F)/single/metrics.jsonl
 ```
 
 验收条件：退出码为 0，输出两行 `world_size: 1` 的指标；`config.json` 中 `device` 为 `cuda`、`amp` 为 `true`、`world_size` 为 1。目录中存在 `checkpoint.pt` 和带 step 编号的 checkpoint。单卡每个 epoch 有 `512 / 32 / 2 = 8` 次 optimizer step；两 epoch 后 checkpoint 的 `global_step` 应为 16，`samples_seen` 应为 1024。
@@ -454,9 +459,9 @@ nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,memory.used,memo
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
-  --device cuda --amp --epochs 2 --samples 512 --batch-size 32 \
-  --accumulation-steps 2 --checkpoint-every-steps 4 \
-  --checkpoint-dir runs/ch9-gpu-<date>/ddp
+  --device cuda --amp --epochs 50 --samples 500000 --batch-size 256 \
+  --accumulation-steps 1 --checkpoint-every-steps 1000 \
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/ddp
 ```
 
 验收条件：退出码为 0；rank 0 输出两个 `world_size: 2` 的指标；只有 rank 0 写入 `config.json`、`metrics.jsonl` 和 checkpoint。每个 rank 每 epoch处理 8 个 batch，累积两次后有 4 个 optimizer step；两 epoch后 checkpoint 的 `global_step` 应为 8、`samples_seen` 应为 1024、`rng_states` 长度应为 2。
@@ -466,10 +471,29 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baselin
 ```bash
 .venv/bin/python -c "import torch; from pathlib import Path
 for name in ('single', 'ddp'):
- p = Path('runs/ch9-gpu-<date>') / name / 'checkpoint.pt'
+ p = Path('runs/ch9-gpu-$(date +%F)') / name / 'checkpoint.pt'
  s = torch.load(p, map_location='cpu', weights_only=False)
  print(name, {'device': s['config']['device'], 'amp': s['config']['amp'], 'world_size': s['config']['world_size'], 'epoch': s['epoch'], 'global_step': s['global_step'], 'samples_seen': s['samples_seen'], 'rng_states': len(s['rng_states'])})"
 ```
+
+对比运行时间
+最简单：用 time 包住命令，或用 date 打时间戳。
+bash
+# 单卡
+start=$(date +%s)
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node=1 -m ddp_baseline.train \
+  --device cuda --amp --epochs 50 --samples 500000 --batch-size 512 \
+  --accumulation-steps 1 --checkpoint-every-steps 1000 \
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/single
+echo "single elapsed: $(( $(date +%s) - start )) s"
+
+# 双卡
+start=$(date +%s)
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
+  --device cuda --amp --epochs 50 --samples 500000 --batch-size 256 \
+  --accumulation-steps 1 --checkpoint-every-steps 1000 \
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/ddp
+echo "ddp elapsed: $(( $(date +%s) - start )) s"
 
 不要比较单卡和双卡 checkpoint 的参数是否完全相等：两种运行的每次更新样本组成和更新次数不同。这里要验证的是每个运行内部的配置、step 和 rank RNG 状态一致。
 
@@ -481,13 +505,13 @@ for name in ('single', 'ddp'):
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
   --device cuda --amp --epochs 1 --samples 256 --batch-size 32 \
   --accumulation-steps 2 --checkpoint-every-steps 2 \
-  --checkpoint-dir runs/ch9-gpu-<date>/resume-source
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/resume-source
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
   --device cuda --amp --epochs 2 --samples 256 --batch-size 32 \
   --accumulation-steps 2 --checkpoint-every-steps 2 \
-  --checkpoint-dir runs/ch9-gpu-<date>/resumed \
-  --resume runs/ch9-gpu-<date>/resume-source/checkpoint.pt
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/resumed \
+  --resume runs/ch9-gpu-$(date +%F)/resume-source/checkpoint.pt
 ```
 
 验收条件：恢复命令打印 `resumed from epoch 1, batch 0, step 2`，并完成 epoch 2；`resumed/checkpoint.pt` 的 `epoch=2`、`global_step=4`、`samples_seen=512`、`rng_states=2`。这同时验证模型、优化器、scheduler、CUDA AMP scaler 和两个 rank 的 RNG 恢复路径。
@@ -500,12 +524,12 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m ddp_baselin
 # 单卡：有效全局 batch = 1 * 32 * 4 = 128。将末尾目录依次改为 perf-single-1、perf-single-2、perf-single-3，完整执行三次。
 CUDA_VISIBLE_DEVICES=0 /usr/bin/time -f 'elapsed=%e s' torchrun --standalone --nproc_per_node=1 -m ddp_baseline.train \
   --device cuda --amp --epochs 10 --samples 8192 --batch-size 32 --accumulation-steps 4 \
-  --checkpoint-every-steps 1000 --checkpoint-dir runs/ch9-gpu-<date>/perf-single-1
+  --checkpoint-every-steps 1000 --checkpoint-dir runs/ch9-gpu-$(date +%F)/perf-single-1
 
 # 双卡：有效全局 batch = 2 * 32 * 2 = 128。将末尾目录依次改为 perf-ddp-1、perf-ddp-2、perf-ddp-3，完整执行三次。
 CUDA_VISIBLE_DEVICES=0,1 /usr/bin/time -f 'elapsed=%e s' torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
   --device cuda --amp --epochs 10 --samples 8192 --batch-size 32 --accumulation-steps 2 \
-  --checkpoint-every-steps 1000 --checkpoint-dir runs/ch9-gpu-<date>/perf-ddp-1
+  --checkpoint-every-steps 1000 --checkpoint-dir runs/ch9-gpu-$(date +%F)/perf-ddp-1
 ```
 
 把每次终端的 `elapsed` 和每个目录最后一行 `metrics.jsonl` 记录为表格，取中位数。强扩展效率公式为 `throughput_2 / (2 * throughput_1)`。不要跨实验目录拼接指标；每次命令都使用新目录，避免旧 metrics 文件污染结果。
@@ -515,15 +539,15 @@ CUDA_VISIBLE_DEVICES=0,1 /usr/bin/time -f 'elapsed=%e s' torchrun --standalone -
 先运行一次短小的双卡任务，并把标准输出和标准错误完整保留。`NCCL_DEBUG` 日志可能包含接口、主机和拓扑信息，不要提交到公开仓库。
 
 ```bash
-mkdir -p reports/ch9-gpu-<date>
+mkdir -p reports/ch9-gpu-$(date +%F)
 CUDA_VISIBLE_DEVICES=0,1 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET \
   torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
   --device cuda --amp --epochs 2 --samples 512 --batch-size 32 \
   --accumulation-steps 2 --checkpoint-every-steps 4 \
-  --checkpoint-dir runs/ch9-gpu-<date>/nccl-log \
-  2>&1 | tee reports/ch9-gpu-<date>/nccl-ddp.log
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/nccl-log \
+  2>&1 | tee reports/ch9-gpu-$(date +%F)/nccl-ddp.log
 
-nvidia-smi topo -m | tee reports/ch9-gpu-<date>/topology.txt
+nvidia-smi topo -m | tee reports/ch9-gpu-$(date +%F)/topology.txt
 ```
 
 验收条件不是“日志中一定出现 Ring”或某个固定网卡名，而是：所有 rank 正常退出；日志没有 `unhandled system error`、`connection refused`、`Failed to initialize` 或 `Watchdog caught collective operation timeout`；记录 NCCL 最终选用的 transport/拓扑信息。NCCL 会随硬件和版本选择不同算法。
@@ -548,13 +572,13 @@ gdb -p <rank-pid>
 
 ```bash
 nsys --version
-mkdir -p reports/ch9-gpu-<date>
+mkdir -p reports/ch9-gpu-$(date +%F)
 CUDA_VISIBLE_DEVICES=0,1 nsys profile --trace=cuda,nvtx,osrt --sample=none \
-  --force-overwrite true -o reports/ch9-gpu-<date>/ddp-timeline \
+  --force-overwrite true -o reports/ch9-gpu-$(date +%F)/ddp-timeline \
   torchrun --standalone --nproc_per_node=2 -m ddp_baseline.train \
   --device cuda --amp --epochs 2 --samples 2048 --batch-size 32 \
   --accumulation-steps 2 --checkpoint-every-steps 1000 \
-  --checkpoint-dir runs/ch9-gpu-<date>/nsys
+  --checkpoint-dir runs/ch9-gpu-$(date +%F)/nsys
 ```
 
 如果 Nsight 版本只跟踪 launcher 而没有跟踪 torchrun 子进程，使用该版本文档规定的 child-process tracing 选项，或直接 profile 某个 rank；不要把一个没有 CUDA/NCCL event 的 report 当作训练时间线。打开报告后，逐项回答：GPU 是否有空洞；空洞前 CPU/加载/同步事件是什么；backward 的 NCCL collective 是否与后续 kernel 重叠；最长 kernel 和 memcpy 是否在关键路径。小 MLP 的时间线极短，主要用于熟悉工具，不足以推导真实大模型的 MFU 或扩展效率。
