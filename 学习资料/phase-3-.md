@@ -1,11 +1,11 @@
 # 第 3 阶段操作手册：训练平台 MVP（裸机路线）
 
 > 周期：第 5-6 个月，每周 15-20 小时
-> 环境：101（CPU 控制面开发/测试）+ 200（GPU 真实训练）
+> 环境：200（单机完成控制面开发、CPU 测试和 GPU 真实训练）
 > 前置：完成第 1 阶段 DDP trainer 和第 2 阶段性能优化
 > 产出：可提交、排队、成组启动、观测、取消、重试和恢复的训练作业平台
 
-本文是按指令执行的手册。先完成裸机版：101 运行控制面，200 运行真实 `torchrun`。每一步完成通过标准并保存证据，未通过不要进入下一步；Kubernetes 留到第 4 阶段。
+本文是按指令执行的手册。全程在 200 完成：同一台机器运行 API、Controller、SQLite、LocalProcessExecutor 和真实 `torchrun`。200 可以联网，因此 Python 包和后续所需资源直接在 200 下载。每一步完成通过标准并保存证据，未通过不要进入下一步；Kubernetes 留到第 4 阶段。
 
 ## 0. 固定环境、路径和边界
 
@@ -19,7 +19,7 @@
 - `run/` 与 `runs/` 分离可以降低清理风险，也方便把平台日志和训练日志分别归档。
 - 裸机 MVP 的边界是单主机、单数据库、GPU ID 分配；不要把它误认为多机调度器。
 
-101 与 200 都执行：
+在 200 执行：
 
 ```bash
 export PLATFORM_ROOT=/workspace/GIT/ai_infra/training-platform-mvp
@@ -27,7 +27,7 @@ export RUN_ROOT=/workspace/GIT/ai_infra/training-platform-runs
 mkdir -p "$PLATFORM_ROOT" "$RUN_ROOT"
 ```
 
-101 用于 FastAPI、Typer、SQLite、Controller 的开发和 CPU/FakeExecutor 测试。真实 GPU 集成时，将 API、Controller 和 `LocalProcessExecutor` 一起部署到 200，后者再启动同机的 `torchrun`；不能让 101 上的 LocalProcessExecutor 直接管理 200 的进程。跨主机控制要等第 4 阶段实现受限 SSH Executor。`run/` 保存平台运行时（DB、锁、handle），`runs/` 保存训练输出（日志、metrics、checkpoint）。模型和数据复用第 2 阶段本地目录，不提交 Git。
+200 同时承担 API、Typer、SQLite、Controller、FakeExecutor 测试和 LocalProcessExecutor 的真实训练。逻辑上仍保留控制面和执行面分离：API 接收意图，Controller 决策，Executor 负责启动/观测/取消同机的 `torchrun`。`run/` 保存平台运行时（DB、锁、handle），`runs/` 保存训练输出（日志、metrics、checkpoint）。模型和数据复用第 2 阶段本地目录，不提交 Git。
 
 ```text
 training-platform-mvp/
@@ -44,7 +44,7 @@ training-platform-mvp/
 
 ### 本章知识点总结
 
-完成后，你应能画出“用户/API → Controller → Executor → torchrun”的链路，并解释为什么 101 不能直接管理 200 上的本地进程，以及为什么跨主机能力要单独抽象成 RemoteProcessExecutor。
+完成后，你应能画出“用户/API → Controller → Executor → torchrun”的链路，并解释同机部署时为什么仍要把 API、Controller 和 Executor 分层，而不是让 API 直接启动训练进程。
 
 ## Step 1：准备主机和 Python 环境（第 5 周第 1 天）
 
@@ -54,45 +54,41 @@ training-platform-mvp/
 
 ### 关键知识点
 
-- Python venv 隔离平台依赖；200 上应复用第 2 阶段已经验证过的 CUDA/PyTorch 环境。
+- Python venv 隔离平台依赖；在 200 上直接复用第 2 阶段已验证的 CUDA/PyTorch venv，并通过网络安装平台依赖。
 - `cuda=True` 只说明 CUDA 可用，不代表显存、驱动、NCCL 或模型路径都正确。
 - 环境证据应包含 Python、框架版本、GPU 型号、显存、驱动和设备数量。
 
-101：
+在 200 创建平台目录，并直接安装控制面依赖：
 
 ```bash
 cd "$PLATFORM_ROOT"
 mkdir -p api controller executor models examples tests/integration docs/evidence docs/incidents run runs
-python3 -m venv .venv
-. .venv/bin/activate
+export PHASE2_ROOT="$HOME/qwen3_phase2"  # 改为第 2 阶段实际项目目录
+source "$PHASE2_ROOT/.venv/bin/activate"
 python -m pip install --upgrade pip
 pip install fastapi 'uvicorn[standard]' typer pydantic sqlalchemy aiosqlite httpx pytest pytest-asyncio pyyaml prometheus-client structlog
-python - <<'PY' | tee docs/evidence/environment-101.txt
-import sys, fastapi, pydantic, sqlalchemy
+python - <<'PY' | tee docs/evidence/environment-200.txt
+import sys, fastapi, pydantic, sqlalchemy, torch
 print('python=', sys.version)
 print('fastapi=', fastapi.__version__)
 print('pydantic=', pydantic.__version__)
 print('sqlalchemy=', sqlalchemy.__version__)
-PY
-```
-
-200（真实集成前先使用已验证的第 2 阶段 CUDA Python 环境）：
-
-```bash
-cd "$PLATFORM_ROOT"
-source /path/to/phase2/.venv/bin/activate  # 替换为第 2 阶段实际 venv 路径
-nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv | tee docs/evidence/nvidia-smi-200.txt
-python - <<'PY' | tee docs/evidence/environment-200.txt
-import torch
 print('torch=', torch.__version__, 'cuda=', torch.cuda.is_available(), 'devices=', torch.cuda.device_count())
 PY
 ```
 
-**通过标准**：101 能导入依赖；200 `cuda=True` 且 GPU 数量正确。两台机器必须能读取同一代码；若不是共享盘，用 Git 和受限 SSH 同步。
+继续在 200 记录 GPU 和驱动信息：
+
+```bash
+cd "$PLATFORM_ROOT"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv | tee docs/evidence/nvidia-smi-200.txt
+```
+
+**通过标准**：200 能导入平台依赖，`cuda=True`，GPU 数量正确。所有证据、代码、SQLite 和训练产物都位于 200 的固定路径。
 
 ### 本步知识点总结
 
-你应能区分“控制面依赖安装成功”和“执行面 GPU 运行条件满足”，并能用证据文件回答“这次实验到底在哪个环境运行”。
+你应能区分“控制面依赖安装成功”和“执行面 GPU 运行条件满足”，并能用证据文件回答“这次实验在 200 的哪个 Python/CUDA 环境运行”。
 
 ## Step 2：实现任务规格和输入校验（第 5 周第 2 天）
 
@@ -270,7 +266,7 @@ trainctl events <JOB_ID>
 
 ```bash
 uvicorn api.main:app --host 127.0.0.1 --port 8000
-# 另开 101 终端：重复提交同 key；修改 YAML 后复用 key；提交 invalid.yaml
+# 另开 200 终端：重复提交同 key；修改 YAML 后复用 key；提交 invalid.yaml
 ```
 
 **通过标准**：首次提交 202，重复提交返回同一 job，改 YAML 后 409，非法输入 422，重启 API 后仍可查询 SQLite。输出保存 `docs/evidence/day17-api-idempotency.txt`。
@@ -297,7 +293,7 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000
 pytest -q tests/test_fake_executor.py tests/test_reconciler.py | tee docs/evidence/day18-fake-executor.txt
 ```
 
-**通过标准**：101 无 GPU 时仍能覆盖 Controller 的成功、失败、hang 和取消分支。
+**通过标准**：即使不实际启动 GPU 训练，200 上的 FakeExecutor 仍能覆盖 Controller 的成功、失败、hang 和取消分支。
 
 ### 本步知识点总结
 
@@ -492,7 +488,7 @@ git status --short
 
 ## 完成检查
 
-- [ ] 101/200 环境和路径已固定，证据齐全。
+- [ ] 200 的环境、路径和证据已固定。
 - [ ] 规格校验、状态机、event 去重、事务测试通过。
 - [ ] API 返回 202，幂等 key 和 CLI 正常。
 - [ ] Fake/Local Executor、PGID 取消和 reconcile 重启测试通过。
@@ -513,4 +509,4 @@ git status --short
 
 ## 与第 4 阶段衔接
 
-稳定后只替换 Executor：可以实现 101 到 200 的受限 SSH `RemoteProcessExecutor`，也可以替换为 `KubernetesExecutor`。API、状态机、幂等、队列、事件和恢复语义保持不变。
+稳定后可将 `LocalProcessExecutor` 替换为 `KubernetesExecutor`，或在具备多机资源时增加远程执行器。API、状态机、幂等、队列、事件和恢复语义保持不变。
