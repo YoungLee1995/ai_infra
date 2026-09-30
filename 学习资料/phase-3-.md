@@ -1,294 +1,193 @@
-## 第 3 阶段操作手册：训练平台 MVP
+# 第 3 阶段操作手册：训练平台 MVP（裸机路线）
 
-> 周期：第 5–6 个月，每周 15–20 小时
+> 周期：第 5-6 个月，每周 15-20 小时
 > 环境：101（CPU 控制面开发/测试）+ 200（GPU 真实训练）
-> 前置：完成第 1 阶段（DDP trainer）和第 2 阶段（性能优化）
-> 产出：一个能提交、排队、成组启动、观测、取消、失败恢复的训练作业平台
+> 前置：完成第 1 阶段 DDP trainer 和第 2 阶段性能优化
+> 产出：可提交、排队、成组启动、观测、取消、重试和恢复的训练作业平台
 
-### 0. 路线选择（先做决定）
+本文是按指令执行的手册。先完成裸机版：101 运行控制面，200 运行真实 `torchrun`。每一步完成通过标准并保存证据，未通过不要进入下一步；Kubernetes 留到第 4 阶段。
 
-你手上有两份路线冲突的材料，必须先选一条：
+## 0. 固定环境、路径和边界
 
-| 维度 | 裸机路线 | K8s 路线 |
-|---|---|---|
-| 执行器 | `subprocess.Popen` + PGID + `torchrun` | Kubernetes Job/Pod |
-| 学习价值 | 深入进程组、信号、故障恢复 | 深入容器编排、调度、声明式 API |
-| 环境要求 | 一台 GPU 机器（200）即可 | 需要 K8s 集群（kind/minikube 或内网） |
-| 面试匹配 | **更贴“训练 Infra 系统工程师”** | 更贴“平台/云原生”岗位 |
-| 你的背景 | NPU 建模偏底层，裸机更顺 | 需补 K8s 生态 |
+101 与 200 都执行：
 
-**建议：先裸机，后 K8s。** 你的目标岗位是“分布式训练/训练平台/训练性能”，裸机路线让你真正理解“DDP 是进程组”这件事——这是训练 Infra 的核心认知，也是 K8s 路线容易掩盖的。K8s 可以作为第 4 阶段的扩展。
-
-**下面按裸机路线展开。** 如果你选 K8s，告诉我，我给对应版本。
-
-### 1. 系统架构与边界（第 5 周第 1 天）
-
-#### 1.1 控制面 / 执行面分离
-
-```text
-101（控制面）                          200（执行面）
-┌─────────────────────┐                ┌──────────────────────┐
-│ FastAPI (API)       │                │ torchrun 进程组       │
-│ Typer CLI (trainctl)│                │  ├─ rank 0           │
-│ Controller/Reconciler│  ── 启动 ──→  │  ├─ rank 1           │
-│ SQLite (状态库)      │                │  └─ ...              │
-│ FakeExecutor (测试)  │  ←─ 观测 ──   │ checkpoint / metrics │
-└─────────────────────┘                └──────────────────────┘
+```bash
+export PLATFORM_ROOT=/workspace/GIT/ai_infra/training-platform-mvp
+export RUN_ROOT=/workspace/GIT/ai_infra/training-platform-runs
+mkdir -p "$PLATFORM_ROOT" "$RUN_ROOT"
 ```
 
-**核心原则**：API 只接收意图，返回 `202 Accepted`，**绝不等待训练结束**。Controller 才负责最终执行。
-
-#### 1.2 项目结构
+101 用于 FastAPI、Typer、SQLite、Controller 的开发和 CPU/FakeExecutor 测试。真实 GPU 集成时，将 API、Controller 和 `LocalProcessExecutor` 一起部署到 200，后者再启动同机的 `torchrun`；不能让 101 上的 LocalProcessExecutor 直接管理 200 的进程。跨主机控制要等第 4 阶段实现受限 SSH Executor。`run/` 保存平台运行时（DB、锁、handle），`runs/` 保存训练输出（日志、metrics、checkpoint）。模型和数据复用第 2 阶段本地目录，不提交 Git。
 
 ```text
 training-platform-mvp/
-  api/
-    main.py            # FastAPI app
-    routes.py          # HTTP 路由
-    cli.py             # Typer CLI (trainctl)
-  controller/
-    worker.py          # 主 reconcile 循环
-    state_machine.py   # 状态迁移纯函数
-    queue.py           # 队列/优先级/admission
-    reconciler.py      # 单个 job 的 reconcile 逻辑
-  executor/
-    base.py            # Executor Protocol, ExecutionHandle, ExecutionStatus
-    fake.py            # FakeExecutor（101 测试）
-    local.py           # LocalProcessExecutor（200 真实）
-  models/
-    spec.py            # Pydantic spec 模型
-    db.py              # SQLAlchemy 表定义
-    domain.py          # 领域对象
-  examples/
-    cpu-smoke.yaml
-    gpu-two.yaml
-    invalid.yaml
-  tests/
-    test_spec.py
-    test_state_machine.py
-    test_queue.py
-    test_reconciler.py
-    test_local_executor.py
-    integration/
-      test_api.py
-      test_recovery.py
-  docs/
-    architecture.md
-    runbook.md
-    incidents/
-    evidence/
-  run/                 # 运行时产物（DB、handle）
-  runs/                # 训练输出（checkpoint、日志）
-  pyproject.toml
-  Makefile
+  api/{main.py,routes.py,cli.py}
+  controller/{worker.py,state_machine.py,queue.py,reconciler.py}
+  executor/{base.py,fake.py,local.py}
+  models/{spec.py,db.py,domain.py}
+  examples/{cpu-smoke.yaml,gpu-two.yaml,invalid.yaml}
+  tests/{test_spec.py,test_state_machine.py,test_queue.py,test_reconciler.py,test_local_executor.py}
+  tests/integration/{test_api.py,test_recovery.py}
+  docs/{architecture.md,runbook.md,evidence/,incidents/}
+  run/ runs/ pyproject.toml Makefile
 ```
 
-**注意 `run/` 和 `runs/` 的分工**：
-- `run/`：平台自身运行时（SQLite DB、handle.json、controller 锁）
-- `runs/`：训练输出（checkpoint、metrics.jsonl、trainer.log）
+## Step 1：准备主机和 Python 环境（第 5 周第 1 天）
 
-#### 1.3 三层事实
+101：
 
-| 层 | 含义 | 存储 |
-|---|---|---|
-| **spec** | 用户意图 | YAML → `jobs.spec_json` |
-| **数据库状态** | 控制面事实 | SQLite `jobs`/`events`/`allocations` |
-| **执行器状态** | 外部事实 | 进程是否存活、退出码、日志 |
+```bash
+cd "$PLATFORM_ROOT"
+mkdir -p api controller executor models examples tests/integration docs/evidence docs/incidents run runs
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+pip install fastapi 'uvicorn[standard]' typer pydantic sqlalchemy aiosqlite httpx pytest pytest-asyncio pyyaml prometheus-client structlog
+python - <<'PY' | tee docs/evidence/environment-101.txt
+import sys, fastapi, pydantic, sqlalchemy
+print('python=', sys.version)
+print('fastapi=', fastapi.__version__)
+print('pydantic=', pydantic.__version__)
+print('sqlalchemy=', sqlalchemy.__version__)
+PY
+```
 
-**面试考点**：为什么不能只信数据库？→ controller 重启后，数据库说 `RUNNING`，但进程可能已经死了。必须通过 `inspect()` 重新观测外部事实。
+200（真实集成前先使用已验证的第 2 阶段 CUDA Python 环境）：
 
-### 2. 任务规格与校验（第 5 周第 2–3 天）
+```bash
+cd "$PLATFORM_ROOT"
+source /path/to/phase2/.venv/bin/activate  # 替换为第 2 阶段实际 venv 路径
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv | tee docs/evidence/nvidia-smi-200.txt
+python - <<'PY' | tee docs/evidence/environment-200.txt
+import torch
+print('torch=', torch.__version__, 'cuda=', torch.cuda.is_available(), 'devices=', torch.cuda.device_count())
+PY
+```
 
-#### 2.1 Pydantic spec 模型
+**通过标准**：101 能导入依赖；200 `cuda=True` 且 GPU 数量正确。两台机器必须能读取同一代码；若不是共享盘，用 Git 和受限 SSH 同步。
+
+## Step 2：实现任务规格和输入校验（第 5 周第 2 天）
+
+创建 `models/spec.py`：
 
 ```python
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+ROOT = "/workspace/GIT/ai_infra/training-platform-runs/"
+FORBIDDEN = {"CUDA_VISIBLE_DEVICES", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"}
 
 class RetryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    maxRetries: int = Field(ge=0, le=10)
-    backoffSeconds: int = Field(ge=1, le=3600)
+    maxRetries: int = Field(ge=0, le=10, default=1)
+    backoffSeconds: int = Field(ge=1, le=3600, default=30)
 
 class JobSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")   # 拒绝未知字段
-    host: str
-    command: list[str] = Field(min_length=1)     # 命令非空
-    args: list[str] = []
-    gpus: list[int] = Field(min_length=1)        # 至少一张卡
-    priority: int = Field(ge=0, le=100)
+    model_config = ConfigDict(extra="forbid")
+    host: str = "gpu200"
+    command: list[str] = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    gpus: list[int] = Field(min_length=1)
+    priority: int = Field(ge=0, le=100, default=50)
     checkpointDir: str
-    retryPolicy: RetryPolicy
+    retryPolicy: RetryPolicy = Field(default_factory=RetryPolicy)
 
     @field_validator("gpus")
     @classmethod
-    def no_duplicate_gpus(cls, v):
-        if len(v) != len(set(v)):
+    def unique(cls, value):
+        if len(value) != len(set(value)):
             raise ValueError("GPU IDs must not contain duplicates")
-        return v
+        return value
 
     @field_validator("checkpointDir")
     @classmethod
-    def checkpoint_in_allowed_root(cls, v):
-        if not v.startswith("/path/to/runs/platform/"):
-            raise ValueError("checkpointDir must be under allowed root")
-        return v
+    def under_root(cls, value):
+        if not value.startswith(ROOT):
+            raise ValueError("checkpointDir is outside allowed root")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def no_executor_env(cls, value):
+        if any(any(key in arg for key in FORBIDDEN) for arg in value):
+            raise ValueError("executor-controlled env override")
+        return value
 ```
 
-#### 2.2 拒绝执行器控制的环境变量
+创建三个 YAML。`examples/gpu-two.yaml`：
 
-用户不得在 spec 里传 `CUDA_VISIBLE_DEVICES`、`RANK`、`WORLD_SIZE`、`MASTER_ADDR`、`MASTER_PORT`。这些由 executor 显式设置。
-
-```python
-FORBIDDEN_ENV_KEYS = {"CUDA_VISIBLE_DEVICES", "RANK", "WORLD_SIZE",
-                       "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"}
-
-@field_validator("args")
-@classmethod
-def no_forbidden_env(cls, v):
-    for arg in v:
-        if any(key in arg for key in FORBIDDEN_ENV_KEYS):
-            raise ValueError(f"env var {arg} is controlled by executor")
-    return v
+```yaml
+host: gpu200
+command: [torchrun]
+args: ["--standalone", "src/train_qwen3_lora.py", "--steps", "8"]
+gpus: [0, 1]
+priority: 50
+checkpointDir: /workspace/GIT/ai_infra/training-platform-runs/demo/checkpoints
+retryPolicy: {maxRetries: 1, backoffSeconds: 5}
 ```
 
-#### 2.3 拒绝测试
+`cpu-smoke.yaml` 使用单卡；`invalid.yaml` 故意放重复 GPU、`RANK=1` 或越权 checkpoint。为以下输入添加 `tests/test_spec.py`：空命令、重复 GPU、负重试次数、越权 checkpoint、RANK 参数、未知字段。
 
-为以下输入各写一个测试：
-
-```python
-def test_empty_command_rejected(): ...
-def test_duplicate_gpu_rejected(): ...
-def test_negative_retries_rejected(): ...
-def test_checkpoint_outside_root_rejected(): ...
-def test_rank_in_args_rejected(): ...
-def test_unknown_field_rejected(): ...
+```bash
+pytest -q tests/test_spec.py | tee docs/evidence/day15-spec-validation.txt
 ```
 
-**记录到 `docs/evidence/day15-spec-validation.md`**。
+**通过标准**：六类非法输入均被拒绝，合法 YAML 可被 `JobSpec.model_validate` 解析。
 
-### 3. 数据库与状态机（第 5 周第 4–5 天）
+## Step 3：数据库、event 和状态机（第 5 周第 3-4 天）
 
-#### 3.1 三张表
-
-```python
-class Job(Base):
-    __tablename__ = "jobs"
-    id = Column(String, primary_key=True)
-    generation = Column(Integer, default=1)
-    spec_json = Column(Text)
-    desired_state = Column(String)      # 用户期望
-    status = Column(String)             # 实际状态
-    attempt = Column(Integer, default=0)
-    reason = Column(String)
-    created_at = Column(DateTime)
-    updated_at = Column(DateTime)
-    next_retry_at = Column(DateTime, nullable=True)
-
-class Event(Base):
-    __tablename__ = "events"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    job_id = Column(String, ForeignKey("jobs.id"))
-    attempt = Column(Integer)
-    from_state = Column(String)
-    to_state = Column(String)
-    reason = Column(String)
-    timestamp = Column(DateTime)
-    payload_json = Column(Text)
-    event_hash = Column(String)
-    __table_args__ = (
-        UniqueConstraint("job_id", "attempt", "to_state", "event_hash",
-                         name="uq_event_dedup"),
-    )
-
-class Allocation(Base):
-    __tablename__ = "allocations"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    job_id = Column(String, ForeignKey("jobs.id"))
-    generation = Column(Integer)
-    host = Column(String)
-    gpu_ids_json = Column(Text)
-    released_at = Column(DateTime, nullable=True)
-```
-
-#### 3.2 状态机
+在 `models/db.py` 建立表：
 
 ```text
-PENDING ──→ ADMITTED ──→ STARTING ──→ RUNNING ──→ SUCCEEDED
-                │              │          │
-                │              │          ├──→ CANCELLING ──→ CANCELLED
-                │              │          └──→ RETRYING ──→ STARTING
-                └──────────────┴──────────────→ FAILED
+jobs: id,generation,spec_json,desired_state,status,attempt,reason,created_at,updated_at,next_retry_at,idempotency_key,spec_hash
+events: job_id,attempt,from_state,to_state,reason,timestamp,payload_json,event_hash（唯一约束）
+allocations: job_id,generation,host,gpu_ids_json,released_at
 ```
 
-**规则**：
-1. 终态（SUCCEEDED / FAILED / CANCELLED）不能被普通 reconcile 改写。
-2. 状态变化和 event 插入在**同一事务**。
-3. 重复观察同一进程状态**不重复计数**（靠 `event_hash` 唯一索引）。
-
-#### 3.3 状态迁移纯函数
+在 `controller/state_machine.py` 实现：
 
 ```python
-VALID_TRANSITIONS = {
+VALID = {
     "PENDING": {"ADMITTED", "CANCELLING"},
     "ADMITTED": {"STARTING", "FAILED", "CANCELLING"},
     "STARTING": {"RUNNING", "RETRYING", "FAILED", "CANCELLING"},
     "RUNNING": {"SUCCEEDED", "RETRYING", "FAILED", "CANCELLING"},
     "RETRYING": {"STARTING", "FAILED", "CANCELLING"},
     "CANCELLING": {"CANCELLED"},
-    "SUCCEEDED": set(),   # 终态
-    "FAILED": set(),
-    "CANCELLED": set(),
+    "SUCCEEDED": set(), "FAILED": set(), "CANCELLED": set(),
 }
+TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
-def transition(current: str, desired: str) -> str:
-    if current in TERMINAL_STATES:
-        return current   # 终态不变
-    if desired not in VALID_TRANSITIONS[current]:
-        raise InvalidTransition(f"{current} -> {desired}")
+def transition(current, desired):
+    if current in TERMINAL:
+        return current
+    if desired not in VALID[current]:
+        raise ValueError(f"invalid transition: {current}->{desired}")
     return desired
 ```
 
-#### 3.4 测试
+状态变化、event 插入、allocation 释放必须在一个事务中完成；用 `event_hash` 去重。测试合法/非法迁移、终态不变、重复 event：
 
-```python
-def test_legal_transition(): ...
-def test_illegal_transition_raises(): ...
-def test_terminal_state_unchanged(): ...
-def test_duplicate_event_not_counted(): ...
+```bash
+pytest -q tests/test_state_machine.py | tee docs/evidence/day16-state-machine.txt
 ```
 
-**记录到 `docs/evidence/day16-state-machine.md`**。
+**通过标准**：重放同一 reconcile 不增加相同 event。
 
-### 4. API 与 CLI（第 5 周第 6–7 天）
+## Step 4：API、幂等提交和 CLI（第 5 周第 5-6 天）
 
-#### 4.1 HTTP 接口
+在 `api/routes.py`、`api/main.py` 实现：
 
-| 操作 | HTTP | 返回 |
+| 方法 | 路径 | 语义 |
 |---|---|---|
-| 提交 | `POST /v1/jobs` | `202 Accepted` + job id |
-| 查询 | `GET /v1/jobs/{id}` | job 状态 |
-| 列表 | `GET /v1/jobs` | job 列表 |
-| 取消 | `POST /v1/jobs/{id}/cancel` | `202` |
-| 事件 | `GET /v1/jobs/{id}/events` | event 列表 |
+| POST | `/v1/jobs` | 创建 PENDING job，返回 202 和 id |
+| GET | `/v1/jobs/{id}` | 查询状态 |
+| GET | `/v1/jobs` | 列表 |
+| POST | `/v1/jobs/{id}/cancel` | 请求取消，返回 202 |
+| GET | `/v1/jobs/{id}/events` | 读取 event |
 
-#### 4.2 幂等提交
+提交必须要求 `Idempotency-Key`：同 key 同 spec 返回原任务；同 key 不同 spec 返回 409。API 只接收意图，绝不等待训练结束。
 
-用 `Idempotency-Key` 实现：
-
-```python
-@app.post("/v1/jobs", status_code=202)
-def submit_job(spec: JobSpec, idempotency_key: str = Header(...)):
-    existing = db.get_by_idempotency_key(idempotency_key)
-    if existing:
-        if existing.spec_hash == hash_spec(spec):
-            return existing   # 同 key 同 spec → 返回原任务
-        raise HTTPException(409, "Idempotency key reused with different spec")
-    # 新任务
-    job = create_job(spec, idempotency_key)
-    return job
-```
-
-#### 4.3 CLI
+`api/cli.py` 提供：
 
 ```bash
 trainctl submit examples/cpu-smoke.yaml --idempotency-key smoke-001
@@ -298,422 +197,110 @@ trainctl cancel <JOB_ID>
 trainctl events <JOB_ID>
 ```
 
-#### 4.4 验证
+验证：
 
 ```bash
 uvicorn api.main:app --host 127.0.0.1 --port 8000
-# 另开终端
-trainctl submit examples/cpu-smoke.yaml --idempotency-key smoke-001
-# 重复同 key → 返回同一 job
-# 改 YAML 后同 key → 409
-# 重启 API → trainctl get 仍能查到
+# 另开 101 终端：重复提交同 key；修改 YAML 后复用 key；提交 invalid.yaml
 ```
 
-**记录到 `docs/evidence/day17-api-idempotency.md`**。
+**通过标准**：首次提交 202，重复提交返回同一 job，改 YAML 后 409，非法输入 422，重启 API 后仍可查询 SQLite。输出保存 `docs/evidence/day17-api-idempotency.txt`。
 
-### 5. Executor 接口与 FakeExecutor（第 5 周第 8 天）
+## Step 5：Executor 抽象和 FakeExecutor（第 5 周第 7-8 天）
 
-#### 5.1 接口定义
+在 `executor/base.py` 定义 `ExecutionHandle(job_id, attempt, pid, pgid, log_path, started_at)`、`ExecutionStatus(phase, exit_code, message)` 和 `start/inspect/cancel` Protocol。在 `executor/fake.py` 实现不启动真实进程的 FakeExecutor，可编程返回 `RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`。
+
+```bash
+pytest -q tests/test_fake_executor.py tests/test_reconciler.py | tee docs/evidence/day18-fake-executor.txt
+```
+
+**通过标准**：101 无 GPU 时仍能覆盖 Controller 的成功、失败、hang 和取消分支。
+
+## Step 6：LocalProcessExecutor、torchrun 和 PGID（第 6 周第 1-2 天）
+
+在 `executor/local.py` 中只允许白名单命令 `torchrun`，按 GPU 数补 `--nproc_per_node`。executor 设置 `CUDA_VISIBLE_DEVICES`，用户不得传 `RANK/WORLD_SIZE`；日志写入 `runs/platform/jobs/<id>/attempt-<n>/trainer.log`。
 
 ```python
-from typing import Protocol
-
-class ExecutionHandle(BaseModel):
-    job_id: str
-    attempt: int
-    pid: int | None = None
-    pgid: int | None = None
-    log_path: str
-    started_at: datetime
-
-class ExecutionStatus(BaseModel):
-    phase: str        # RUNNING / SUCCEEDED / FAILED / UNKNOWN
-    exit_code: int | None = None
-    message: str | None = None
-
-class Executor(Protocol):
-    def start(self, job: Job, attempt: int) -> ExecutionHandle: ...
-    def inspect(self, handle: ExecutionHandle) -> ExecutionStatus: ...
-    def cancel(self, handle: ExecutionHandle) -> None: ...
+proc = subprocess.Popen(
+    argv, start_new_session=True, cwd=PLATFORM_ROOT, env=env,
+    stdout=log_file, stderr=subprocess.STDOUT,
+)
+pgid = os.getpgid(proc.pid)
 ```
 
-#### 5.2 FakeExecutor
+`inspect()` 查询进程和持久化退出码；`cancel()` 先 `os.killpg(pgid, SIGTERM)`，等待 10 秒后才 `SIGKILL`。不要只杀 PID，否则 DDP rank 会成为孤儿进程。
 
-```python
-class FakeExecutor:
-    def __init__(self, outcome: str = "succeed"):
-        self.outcome = outcome
-        self.handles: dict[str, ExecutionStatus] = {}
+200 上从平台实际启动一次 2 step 作业，并验证日志、handle、退出码和 PGID 取消：
 
-    def start(self, job, attempt):
-        handle = ExecutionHandle(
-            job_id=job.id, attempt=attempt,
-            log_path=f"/fake/{job.id}/attempt-{attempt}.log",
-            started_at=datetime.utcnow(),
-        )
-        self.handles[handle.job_id] = ExecutionStatus(phase="RUNNING")
-        return handle
-
-    def inspect(self, handle):
-        return self.handles[handle.job_id]
-
-    def complete(self, handle, outcome: str):
-        self.handles[handle.job_id] = ExecutionStatus(
-            phase=outcome.upper(),
-            exit_code=0 if outcome == "succeed" else 1,
-        )
-
-    def cancel(self, handle):
-        self.handles[handle.job_id] = ExecutionStatus(phase="CANCELLED")
+```bash
+uvicorn api.main:app --host 127.0.0.1 --port 8000
+# 另开 200 终端
+python -m controller.worker --interval 2
+# 再开终端
+trainctl submit examples/cpu-smoke.yaml --idempotency-key local-smoke-001
+trainctl get <JOB_ID>
+cat run/jobs/<JOB_ID>/attempt-1/handle.json
+kill -TERM -<PGID>
 ```
 
-#### 5.3 测试
+**通过标准**：日志、handle 和退出码均可查询；发送 SIGTERM 后整个进程组消失；重复 reconcile 不得启动第二个 torchrun。保存 `docs/evidence/day19-reconcile-idempotent.txt`。
 
-```python
-def test_fake_success(): ...
-def test_fake_failure(): ...
-def test_fake_hang(): ...
-def test_fake_cancel(): ...
-```
+## Step 7：Controller reconcile（第 6 周第 2-3 天）
 
-**记录到 `docs/evidence/day18-fake-executor.md`**。
-
-### 6. Controller 与 LocalProcessExecutor（第 6 周第 1–3 天）
-
-#### 6.1 reconcile 循环
-
-```python
-def reconcile_loop(db, executor, interval=2):
-    while True:
-        for job in db.list_non_terminal_jobs():
-            reconcile_one(job, db, executor)
-        time.sleep(interval)
-
-def reconcile_one(job, db, executor):
-    with db.transaction():   # BEGIN IMMEDIATE
-        if job.desired_state == "CANCELLED" and job.status != "CANCELLED":
-            handle = db.get_handle(job.id, job.attempt)
-            executor.cancel(handle)
-            release_allocation(db, job)
-            transition_and_event(db, job, "CANCELLED", reason="user cancel")
-            return
-
-        if job.status == "PENDING" and all_gpus_free(db, job.spec.gpus):
-            allocate_gpus(db, job)
-            transition_and_event(db, job, "ADMITTED", reason="gpus available")
-            return
-
-        if job.status == "ADMITTED":
-            handle = executor.start(job, job.attempt + 1)
-            save_handle(db, handle)
-            transition_and_event(db, job, "STARTING", reason="process started")
-            return
-
-        if job.status == "STARTING":
-            status = executor.inspect(db.get_handle(job.id, job.attempt))
-            if status.phase == "RUNNING":
-                transition_and_event(db, job, "RUNNING", reason="metrics appeared")
-            return
-
-        if job.status == "RUNNING":
-            status = executor.inspect(db.get_handle(job.id, job.attempt))
-            if status.phase == "SUCCEEDED":
-                release_allocation(db, job)
-                transition_and_event(db, job, "SUCCEEDED", reason="exit 0")
-            elif status.phase == "FAILED":
-                release_allocation(db, job)
-                classification = classify_failure(status.exit_code)
-                if classification == "RETRYABLE" and job.attempt < job.spec.retryPolicy.maxRetries:
-                    next_retry = now() + backoff(job.attempt)
-                    transition_and_event(db, job, "RETRYING",
-                                          reason=f"exit {status.exit_code}",
-                                          next_retry_at=next_retry)
-                else:
-                    transition_and_event(db, job, "FAILED",
-                                          reason=f"exit {status.exit_code}")
-            return
-
-        if job.status == "RETRYING":
-            if now() >= job.next_retry_at:
-                job.attempt += 1
-                transition_and_event(db, job, "STARTING", reason="retry")
-            return
-```
-
-#### 6.2 LocalProcessExecutor
-
-```python
-class LocalProcessExecutor:
-    def start(self, job, attempt):
-        argv = self._build_argv(job)
-        log_path = f"runs/platform/jobs/{job.id}/attempt-{attempt}/trainer.log"
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in job.spec.gpus)
-        # 不设置 RANK/WORLD_SIZE —— 由 torchrun 自己管
-
-        log_file = open(log_path, "a")
-        proc = subprocess.Popen(
-            argv,
-            start_new_session=True,     # ← 独立进程组
-            cwd="/workspace/GIT/ai_infra/training-platform-mvp",
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
-        pgid = os.getpgid(proc.pid)
-
-        handle = ExecutionHandle(
-            job_id=job.id, attempt=attempt,
-            pid=proc.pid, pgid=pgid,
-            log_path=log_path,
-            started_at=datetime.utcnow(),
-        )
-        self._save_handle(handle)
-        return handle
-
-    def _build_argv(self, job):
-        # 白名单校验
-        if job.spec.command[0] != "torchrun":
-            raise ValueError("only torchrun allowed")
-        argv = list(job.spec.command)
-        # 根据 gpus 数量生成 --nproc_per_node
-        if "--nproc_per_node" not in " ".join(argv):
-            argv.insert(1, f"--nproc_per_node={len(job.spec.gpus)}")
-        argv.extend(job.spec.args)
-        return argv
-
-    def inspect(self, handle):
-        try:
-            os.kill(handle.pid, 0)   # 检查进程是否存在
-            return ExecutionStatus(phase="RUNNING")
-        except ProcessLookupError:
-            exit_code = self._read_exit_code(handle)
-            return ExecutionStatus(
-                phase="SUCCEEDED" if exit_code == 0 else "FAILED",
-                exit_code=exit_code,
-            )
-
-    def cancel(self, handle):
-        try:
-            os.killpg(handle.pgid, signal.SIGTERM)
-            # 等待 10 秒
-            for _ in range(10):
-                time.sleep(1)
-                try:
-                    os.killpg(handle.pgid, 0)
-                except ProcessLookupError:
-                    return
-            os.killpg(handle.pgid, signal.SIGKILL)   # 超时才强杀
-        except ProcessLookupError:
-            pass
-```
-
-**关键点**：
-- `start_new_session=True`：让子进程成为**新进程组组长**，PGID = PID。
-- `os.killpg(pgid, SIGTERM)`：杀**整个进程组**，不是单个 PID。DDP 有多个 rank，杀一个 PID 会留下孤儿进程。
-- `CUDA_VISIBLE_DEVICES` 由 executor 显式设置，用户 YAML 不能覆盖。
-
-#### 6.3 验证：重复 reconcile 不重复启动
-
-```python
-def test_reconcile_idempotent():
-    # 同一个 job 连续 reconcile 两次
-    reconcile_one(job, db, executor)
-    reconcile_one(job, db, executor)
-    # 只应启动一个进程
-    assert executor.start_count == 1
-```
-
-```python
-def test_controller_restart_no_duplicate():
-    # 启动 controller，等 job 到 RUNNING
-    # 停止 controller
-    # 重启 controller
-    # 确认没有第二个 torchrun 进程
-```
-
-**记录到 `docs/evidence/day19-reconcile-idempotent.md`**。
-
-### 7. 队列与 gang admission（第 6 周第 4–5 天）
-
-#### 7.1 选择纯函数
-
-```python
-def select_next_admission(pending_jobs, free_gpus):
-    """只看 PENDING，按 priority DESC, created_at ASC, id ASC 排序。"""
-    candidates = sorted(
-        [j for j in pending_jobs if j.status == "PENDING"],
-        key=lambda j: (-j.spec.priority, j.created_at, j.id),
-    )
-    for job in candidates:
-        requested = set(job.spec.gpus)
-        if requested.issubset(free_gpus):
-            return job
-    return None
-```
-
-#### 7.2 gang admission
-
-**核心规则：全有或全无。** 任务请求 `[0,1]` 而只空闲 `[0]` 时，必须保持 `PENDING`：
+`controller/worker.py` 每 2 秒扫描非终态任务；`reconciler.py` 的基本流转：
 
 ```text
-waiting for full GPU allocation: requested=[0,1], available=[0], queue_position=2
+PENDING + GPU 足够 -> ADMITTED -> STARTING -> RUNNING -> SUCCEEDED
+RUNNING 失败 -> RETRYING（指数退避）或 FAILED
+任意非终态 + desired=CANCELLED -> CANCELLING -> CANCELLED
 ```
 
-#### 7.3 原子分配
+每次启动前检查已有 handle；Controller 重启后通过 `executor.inspect(handle)` 校验外部事实，不能只信数据库中的 RUNNING。测试成功、失败、取消、重试、重启不重复启动：
 
-```python
-def allocate_gpus(db, job):
-    with db.connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")   # 排他锁
-        free = read_free_gpus(conn)
-        if not set(job.spec.gpus).issubset(free):
-            conn.rollback()
-            return False
-        conn.execute(
-            "INSERT INTO allocations (job_id, generation, host, gpu_ids_json) "
-            "VALUES (?, ?, ?, ?)",
-            (job.id, job.generation, job.spec.host, json.dumps(job.spec.gpus)),
-        )
-        conn.execute("UPDATE jobs SET status = 'ADMITTED' WHERE id = ?", (job.id,))
-        conn.commit()
-        return True
+```bash
+pytest -q tests/test_reconciler.py
 ```
 
-#### 7.4 验证
+## Step 8：队列和 gang admission（第 6 周第 4-5 天）
+
+在 `controller/queue.py` 按 `priority DESC, created_at ASC, id ASC` 选择任务；GPU 必须全有或全无。分配时用 SQLite `BEGIN IMMEDIATE`，在锁内重新读取 free set、插入 allocation、更新状态。
 
 ```bash
 python -m controller.hosts register --host gpu200 --gpus 0,1
-trainctl submit examples/gpu-two.yaml
-trainctl submit examples/gpu-two.yaml --name gpu-two-b
+trainctl submit examples/gpu-two.yaml --idempotency-key gpu-a
+trainctl submit examples/gpu-two.yaml --idempotency-key gpu-b
 watch -n 1 'trainctl list; nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'
 ```
 
-**验收**：
-- 第二个任务保持 `PENDING`，event reason 说明请求 `[0,1]` 而可用 `[0]`。
-- 第一个释放后，第二个**一次性**进入 `ADMITTED`。
-- 并发 reconcile 测试的 allocation 总数不超过登记 GPU 数。
+**通过标准**：第一个占 `[0,1]` 时第二个保持 PENDING，reason 写 requested/available；释放后第二个一次性 ADMITTED；并发测试不超卖。保存 `docs/evidence/day20-gang-admission.txt`。
 
-**记录到 `docs/evidence/day20-gang-admission.md`**。
-
-### 8. Checkpoint、重试与恢复（第 6 周第 6–7 天）
-
-#### 8.1 每 attempt 独立目录
+## Step 9：checkpoint、重试和恢复（第 6 周第 6-7 天）
 
 ```text
-runs/platform/jobs/<job-id>/
-  attempt-1/trainer.log
-  attempt-1/checkpoints/checkpoint.pt
-  attempt-2/trainer.log
-  attempt-2/checkpoints/checkpoint.pt
+runs/platform/jobs/<id>/attempt-1/{trainer.log,checkpoints/checkpoint.pt}
+runs/platform/jobs/<id>/attempt-2/{trainer.log,checkpoints/checkpoint.pt}
 ```
 
-#### 8.2 错误分类
-
-| 类别 | 例子 | 动作 |
-|---|---|---|
-| `INFRASTRUCTURE` | worker 被终止、进程意外消失 | 指数退避重试 |
-| `TRANSIENT_IO` | 暂时读写失败 | 指数退避重试 |
-| `USER_ERROR` | 参数错误、traceback、退出码 2 | 直接失败 |
-| `CANCELLED` | 用户取消 | 不重试 |
-
-```python
-def classify_failure(exit_code):
-    if exit_code == 2:
-        return "USER_ERROR"
-    if exit_code in (137, 143):   # SIGKILL / SIGTERM
-        return "INFRASTRUCTURE"
-    return "UNKNOWN"
-
-def backoff(attempt, base=30, max_backoff=600):
-    return min(base * 2 ** (attempt - 1), max_backoff)
-```
-
-#### 8.3 恢复验证
+退出码 2 是 `USER_ERROR`（不重试），137/143 是 `INFRASTRUCTURE`（重试）；临时 I/O 可重试；取消不重试。退避：`min(base * 2 ** (attempt - 1), 600)`。checkpoint 先写临时文件和 fsync，再 `os.replace(tmp, final)`。
 
 ```bash
-# 确认 attempt-1 已产生 checkpoint
+trainctl submit examples/gpu-two.yaml --idempotency-key recovery-001
 cat run/jobs/<JOB_ID>/attempt-1/handle.json
 kill -TERM -<PGID>
 watch -n 1 'trainctl get <JOB_ID>; trainctl events <JOB_ID>'
 ```
 
-**验收**：
-- 出现 `RETRYING` 和 `attempt-2`。
-- 从最近有效 checkpoint 恢复。
-- 比较两次 `metrics.jsonl` 的最大 `global_step`，后一次不得倒退。
+**通过标准**：出现 RETRYING、attempt-2，从最近 checkpoint 恢复，后一次 `metrics.jsonl` 的最大 global_step 不倒退。保存 `docs/evidence/day21-checkpoint-recovery.txt`。
 
-**记录到 `docs/evidence/day21-checkpoint-recovery.md`**。
+## Step 10：指标、日志和故障演练（第 6 周第 8-10 天）
 
-### 9. 可观测性与故障演练（第 6 周第 8–10 天）
+暴露 `training_jobs{state}`、`training_queue_wait_seconds`、`training_admission_latency_seconds`、`training_attempts_total{outcome}`、`training_recovery_seconds`、`training_failures_total{classification}`。label 只能使用有限集合，禁止 job id。JSON 日志至少含 timestamp、component、job_id、attempt、host、gpu_ids、event、reason、exit_code。
 
-#### 9.1 Prometheus 指标
+每次只注入一种故障：worker SIGTERM、受控 NCCL timeout、测试目录磁盘写失败、固定 `FAIL_AT_STEP` 主进程异常。验收分别为重试恢复、有界失败、旧 checkpoint 可读、USER_ERROR 不重试。每次记录到 `docs/incidents/<date>-<case>.md`，并汇总 `docs/evidence/day22-failure-drills.md`。
 
-```text
-training_jobs{state="PENDING"}                    gauge
-training_queue_wait_seconds                         histogram
-training_admission_latency_seconds                  histogram
-training_attempts_total{outcome="retry|success"}   counter
-training_recovery_seconds                            histogram
-training_failures_total{classification="..."}      counter
-```
+## Step 11：最终演示和验收（第 6 周第 11-14 天）
 
-**标签只使用有限集合，禁止把 job id 放进 Prometheus label**（基数爆炸）。
-
-#### 9.2 结构化日志
-
-JSON 日志最少包含：
-
-```json
-{
-  "timestamp": "...",
-  "level": "INFO",
-  "component": "controller",
-  "job_id": "...",
-  "attempt": 1,
-  "host": "gpu200",
-  "gpu_ids": [0, 1],
-  "event": "state_transition",
-  "reason": "exit 0",
-  "exit_code": 0
-}
-```
-
-#### 9.3 四类故障演练
-
-| 故障 | 安全注入 | 验收 |
-|---|---|---|
-| worker 消失 | 对保存的 PGID 发 `SIGTERM` | `RETRYING`、新 attempt、step 连续 |
-| 通信超时 | 仅在受控多 rank 测试设置短 timeout | 有界失败，不无限 hang |
-| 磁盘写入失败 | 测试目录 + 小文件限制 | 旧 checkpoint 可读 |
-| 主进程异常 | 固定退出码 `FAIL_AT_STEP` | `USER_ERROR` 且不重试 |
-
-每次只注入一个故障，记录到 `docs/incidents/<date>-<case>.md`：
-
-- 时间、commit、主机/GPU
-- 注入命令
-- 预期/实际状态
-- event/log/metrics 路径
-- 恢复耗时、checkpoint step、清理结果
-
-**记录到 `docs/evidence/day22-failure-drills.md`**。
-
-### 10. 最终演示与证据包（第 6 周第 11–14 天）
-
-#### 10.1 演示顺序（固定）
-
-```text
-1. 提交两个竞争 GPU 的任务 → 展示排队原因
-2. 启动双卡 DDP → 展示 torchrun、GPU 映射、日志
-3. 查看 metrics / events / profiler
-4. 终止 worker → 展示 RETRYING → attempt-2 → step 连续
-5. 取消另一个任务 → 展示 CANCELLING → CANCELLED
-6. 讲一份算子/图优化或 DDP 性能报告
-```
-
-#### 10.2 最终验收
+固定演示顺序：提交两个竞争 GPU 的任务；启动双卡 DDP；查看 metrics/events/profiler；终止 worker 展示 `RETRYING -> attempt-2`；取消另一个任务展示 `CANCELLING -> CANCELLED`；讲解第 2 阶段性能报告。
 
 ```bash
 make lint
@@ -725,35 +312,29 @@ find docs/evidence docs/incidents -type f | sort
 git status --short
 ```
 
-#### 10.3 交付清单
+交付架构图、状态机/幂等/队列/checkpoint 设计、runbook、单卡/双卡/非法 YAML、测试报告、四份故障记录、第 2 阶段性能报告及“无多机/K8s”限制。
 
-| 交付物 | 内容 |
-|---|---|
-| **架构图** | 控制面/执行面边界 |
-| **设计文档** | 状态机、幂等、队列/gang、checkpoint 语义 |
-| **运行手册** | 部署、清理、常见故障排查 |
-| **任务 YAML** | 单卡、双卡、非法三份 |
-| **测试报告** | 单元 + 集成 + 故障注入 |
-| **性能报告** | 第 2 阶段的 profiler 和优化结果 |
-| **故障记录** | 四份 `docs/incidents/*.md` |
-| **已知限制** | 无真实多机时明确标注 |
+## 完成检查
 
-### 11. 面试自测题
+- [ ] 101/200 环境和路径已固定，证据齐全。
+- [ ] 规格校验、状态机、event 去重、事务测试通过。
+- [ ] API 返回 202，幂等 key 和 CLI 正常。
+- [ ] Fake/Local Executor、PGID 取消和 reconcile 重启测试通过。
+- [ ] gang admission 不超卖，checkpoint 可恢复，重试分类正确。
+- [ ] 四类故障独立注入并有 incident 记录。
+- [ ] `make test`、集成测试和最终演示通过。
 
-1. 为什么 API 返回 `202` 而不是 `200`？两者语义区别是什么？
-2. Controller 重启后，如何判断一个 `RUNNING` 的 job 是否真的还在跑？
-3. 为什么杀 PID 不等于杀 DDP 作业？PGID 的作用是什么？
-4. gang admission 的“全有或全无”为什么必须用 `BEGIN IMMEDIATE` 保护？
-5. `Idempotency-Key` 同 key 不同 spec 返回 409，这个设计防住了什么？
-6. checkpoint 原子写入为什么用 `os.replace` 而不是直接覆盖？
-7. 为什么 Prometheus label 里不能放 job id？
-8. 你的平台在 controller 崩溃后如何恢复状态？
+## 面试自测
 
-### 12. 与第 4 阶段的衔接
+1. 为什么 API 返回 202 而不是 200？
+2. Controller 重启后如何验证 RUNNING 的外部事实？
+3. 为什么杀 PID 不等于杀 DDP 作业？
+4. gang admission 为什么需要 `BEGIN IMMEDIATE`？
+5. 同 key 不同 spec 为何返回 409？
+6. checkpoint 为什么用临时文件加 `os.replace`？
+7. Prometheus label 为什么不能放 job id？
+8. Controller 崩溃后如何避免重复启动？
 
-第 3 阶段的裸机执行器稳定后，第 4 阶段可以：
+## 与第 4 阶段衔接
 
-- **抽象出 `RemoteProcessExecutor`**：controller 在 101，训练在 200，通过受限 SSH 调用固定 runner 脚本。
-- **或迁移到 K8s**：把 `LocalProcessExecutor` 替换为 `KubernetesExecutor`，其余状态机、队列、API 全部复用。
-
-无论哪条，**第 3 阶段的 Executor Protocol、状态机、队列逻辑都不变**——这正是接口抽象的价值。
+稳定后只替换 Executor：可以实现 101 到 200 的受限 SSH `RemoteProcessExecutor`，也可以替换为 `KubernetesExecutor`。API、状态机、幂等、队列、事件和恢复语义保持不变。
